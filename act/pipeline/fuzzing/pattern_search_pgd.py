@@ -289,9 +289,18 @@ def run_pattern_search_pgd(args: argparse.Namespace) -> dict[str, Any]:
         categories=[args.category], max_instances=load_instances,
     )
     if not spec_results:
+        from act.front_end.vnnlib_loader.data_model_loader import list_local_categories
+
+        if args.category in list_local_categories():
+            raise RuntimeError(
+                f"category={args.category!r} is downloaded, but every instance failed to parse into a spec "
+                "(see the 'Failed to create specs for ...' warnings above -- a common cause is that the "
+                "on-disk .vnnlib files are VNNLIB 1.0 (flat) format, which this ACT build no longer accepts; "
+                "it requires VNNLIB 2.0 files declaring (vnnlib-version)/(declare-network))."
+            )
         raise RuntimeError(
-            f"No VNNLIB specs were loaded for category={args.category!r}. "
-            f"Download the benchmark first with: python -m act.pipeline --download {args.category}"
+            f"No VNNLIB specs were loaded for category={args.category!r}: this category is not downloaded. "
+            f"Download it first with: python -m act.pipeline --download {args.category}"
         )
     if args.instance_index is not None:
         if not (0 <= args.instance_index < len(spec_results)):
