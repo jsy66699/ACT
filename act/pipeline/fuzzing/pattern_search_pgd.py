@@ -1,27 +1,45 @@
 """
-PatternSearchPGD: two-phase pattern-space PGD attack.
+PatternSearchPGD: pattern-space PGD attack with a collect/attack split, run
+over up to three rounds.
 
-Phase 1 (collect): repeatedly sample a fresh random point in the instance's
-input box, build a target ReLU sign pattern by flipping a random subset of
-that point's own natural pattern, and run a margin-loss projected-gradient
-walk toward that target. Every projected point is kept in a diversity pool
-only if its actually-achieved sign pattern differs from every pattern
-already pooled by at least --min-diversity-hamming neurons, so the pool ends
-up covering many different activation regions instead of near-duplicates of
-the same one.
-
-Phase 2 (attack): run real violation-maximizing PGD from every pooled point
-and check each result against the instance's OutputSpec for an actual
+Round 1 (broad probe): repeatedly sample a fresh random point in the
+instance's input box, build a target ReLU sign pattern by flipping a random
+subset of that point's own natural pattern, and run a margin-loss
+projected-gradient walk toward that target. Every projected point is kept in
+a diversity pool only if its actually-achieved sign pattern differs from
+every pattern already pooled by at least --min-diversity-hamming neurons, so
+the pool ends up covering many different activation regions instead of
+near-duplicates of the same one. Every collection round is immediately
+followed by an attack phase: real violation-maximizing PGD from every newly
+pooled point, checked against the instance's OutputSpec for an actual
 counterexample.
 
-This deliberately does not hill-climb toward any single target: every phase
-1 attempt starts from an independent random point and a freshly randomized
-target pattern, trading exploitation for breadth of pattern coverage before
-spending any attack-PGD budget.
+Round 2 (empirically-focused probe, opt-in via --round2-iterations): round
+1's pool empirically reveals which neurons actually flipped at least once
+(as opposed to the bound-propagation notion of "unstable" -- this is a
+strictly-observed, possibly tighter subset). Round 2 restricts flip
+candidates to just that subset and repeats round 1's collect+attack cycle.
+
+Round 3 (anchor pull-back, opt-in via --round3-iterations, only runs if
+round 2 found a real counterexample): each attempt starts from a random
+round-2 counterexample's own (input, achieved pattern) as an anchor, nudges
+the anchor input by a small random perturbation (--round3-noise-scale;
+starting exactly at the anchor gives zero margin-loss gradient), then
+gradient-walks back toward the anchor's OWN pattern -- stopping as soon as
+the achieved Hamming distance to it is <= --round3-hamming-radius. This
+densely samples new inputs near a known-good (i.e. actually violating)
+region instead of exploring blindly, exploiting round 2's find.
+
+None of the three rounds hill-climbs toward any single target within a
+round: every collection attempt starts from an independent random point (or
+anchor, in round 3) and a freshly randomized target pattern, trading
+exploitation for breadth of pattern coverage before spending attack-PGD
+budget.
 
 Usage:
     python -m act.pipeline.fuzzing.pattern_search_pgd \\
-        --category mnist_fc --collect-iterations 200 --flip-count 10
+        --category mnist_fc --collect-iterations 200 --flip-count 10 \\
+        --round2-iterations 200 --round3-iterations 200
 
 Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
@@ -30,9 +48,11 @@ License: AGPLv3+
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import secrets
+import statistics
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -328,103 +348,303 @@ def run_pattern_search_pgd(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[PatternSearchPGD] model={model_id}, total_relu_neurons={total_relu_neurons}")
     all_indices = torch.arange(total_relu_neurons, device=device)
 
-    # ---------------- Phase 1: diverse pattern collection ----------------
+    # ---------------- shared collect/attack state across all rounds ----------------
     pool_points: list[torch.Tensor] = []
     pool_patterns: list[torch.Tensor] = []
     tree = _PatternBKTree()
     # threshold for has_within is "closer than min_diversity_hamming", i.e.
     # reject if some pooled point is within (min_diversity_hamming - 1).
     reject_threshold = max(0, args.min_diversity_hamming - 1)
+    collect_rows: list[dict[str, Any]] = []
+    all_attack_rows: list[dict[str, Any]] = []
+    round_attack_stats: dict[str, dict[str, Any]] = {}
+    all_counterexamples: list[Counterexample] = []
+    saved_ce_count = 0
 
-    phase1_start = time.time()
-    attempts = 0
-    while attempts < args.collect_iterations:
-        if time.time() - phase1_start >= args.collect_timeout:
-            print(f"[PatternSearchPGD] Phase 1 timeout reached after {attempts} attempts.")
-            break
-        if args.pool_target > 0 and len(pool_points) >= args.pool_target:
-            print(f"[PatternSearchPGD] Phase 1: pool reached target size {args.pool_target}, stopping early.")
-            break
-        attempts += 1
-
-        base_point = sample_point()
-        natural_pattern = _relu_sign_pattern(wrapped_model, base_point)
-        target_pattern = _flip_pattern(natural_pattern, args.flip_count, all_indices)
-        for _ in range(args.flip_retry_attempts):
-            if not tree.has_within(target_pattern, reject_threshold):
+    def collect_round(round_name: str, iterations: int, timeout: float, candidates: torch.Tensor) -> int:
+        """Round 1/2: independent random-flip projection attempts against
+        `candidates`, appending diverse results into the shared pool/tree.
+        Returns the number of attempts actually made."""
+        round_start = time.time()
+        made = 0
+        while made < iterations:
+            if time.time() - round_start >= timeout:
+                print(f"[PatternSearchPGD] {round_name} timeout reached after {made} attempts.")
                 break
-            target_pattern = _flip_pattern(natural_pattern, args.flip_count, all_indices)
+            if args.pool_target > 0 and len(pool_points) >= args.pool_target:
+                print(f"[PatternSearchPGD] {round_name}: pool reached target size {args.pool_target}, stopping early.")
+                break
+            made += 1
 
-        projected = _project_to_pattern(
-            base_point, wrapped_model, lb, ub, target_pattern,
-            args.pattern_steps, args.pattern_margin, args.pattern_step_size,
-        )
-        achieved_pattern = _relu_sign_pattern(wrapped_model, projected)
-        if not tree.has_within(achieved_pattern, reject_threshold):
-            pool_points.append(projected)
-            pool_patterns.append(achieved_pattern)
-            tree.insert(achieved_pattern)
+            base_point = sample_point()
+            natural_pattern = _relu_sign_pattern(wrapped_model, base_point)
+            target_pattern = _flip_pattern(natural_pattern, args.flip_count, candidates)
+            flip_retry_count = 0
+            while flip_retry_count < args.flip_retry_attempts and tree.has_within(target_pattern, reject_threshold):
+                target_pattern = _flip_pattern(natural_pattern, args.flip_count, candidates)
+                flip_retry_count += 1
 
-        if args.report_interval > 0 and attempts % args.report_interval == 0:
-            print(
-                f"[PatternSearchPGD] phase1 attempts={attempts}/{args.collect_iterations}, "
-                f"pool_size={len(pool_points)}"
+            projected = _project_to_pattern(
+                base_point, wrapped_model, lb, ub, target_pattern,
+                args.pattern_steps, args.pattern_margin, args.pattern_step_size,
             )
+            achieved_pattern = _relu_sign_pattern(wrapped_model, projected)
+            kept = not tree.has_within(achieved_pattern, reject_threshold)
+            if kept:
+                pool_points.append(projected)
+                pool_patterns.append(achieved_pattern)
+                tree.insert(achieved_pattern)
+
+            collect_rows.append({
+                "round": round_name, "attempt": made, "kept": bool(kept),
+                "pool_size_after": len(pool_points), "flip_retry_count": flip_retry_count,
+            })
+            if args.report_interval > 0 and made % args.report_interval == 0:
+                print(f"[PatternSearchPGD] {round_name} attempts={made}/{iterations}, pool_size={len(pool_points)}")
+        return made
+
+    def attack_phase(points: list[torch.Tensor], round_name: str) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Real violation-maximizing PGD on `points`, checked for actual
+        counterexamples. Returns (final adversarial input, achieved ReLU
+        sign pattern) for every point that turned out to be a real
+        counterexample -- used by round 3 as anchors."""
+        nonlocal saved_ce_count
+        print(f"[PatternSearchPGD] Attacking {len(points)} pooled point(s) from {round_name}...")
+        attack_start = time.time()
+        round_ce_count = 0
+        ce_records: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for i, point in enumerate(points):
+            adv_input = _attack_pgd(
+                point, wrapped_model, lb, ub, output_spec, label, args.pgd_steps, args.pgd_step_size,
+            )
+            with torch.no_grad():
+                out = wrapped_model(adv_input)
+                outputs = out["output"] if isinstance(out, dict) else out
+            seeds = FuzzingSeed(
+                tensor=adv_input, original_tensor=point,
+                original_index=torch.zeros(1, dtype=torch.long, device=device), label=label,
+            )
+            violation_mask, batch_ces = checker.check(inputs=adv_input, outputs=outputs, seeds=seeds)
+            is_ce = bool(violation_mask[0].item())
+            score = float(_violation_score(output_spec, outputs, label)[0].item())
+
+            all_attack_rows.append({
+                "round": round_name, "pool_index": i, "is_counterexample": is_ce, "violation_score": score,
+            })
+            if is_ce:
+                round_ce_count += 1
+                # Use the FINAL adversarial input's own pattern, not the pre-attack-PGD
+                # projection's pattern -- the attack PGD steps can shift it.
+                ce_records.append((adv_input.detach(), _relu_sign_pattern(wrapped_model, adv_input)))
+                for ce in batch_ces:
+                    all_counterexamples.append(ce)
+                    if not args.no_save:
+                        ce.save(output_dir / f"ce_{saved_ce_count + 1}.pt")
+                    saved_ce_count += 1
+
+            if args.report_interval > 0 and (i + 1) % args.report_interval == 0:
+                print(f"[PatternSearchPGD] {round_name} attack {i + 1}/{len(points)}, counterexamples={round_ce_count}")
+
+        elapsed = time.time() - attack_start
+        rate = 100.0 * round_ce_count / len(points) if points else 0.0
+        print(
+            f"[PatternSearchPGD] {round_name} attack done: {round_ce_count}/{len(points)} counterexamples "
+            f"({rate:.1f}%) in {elapsed:.1f}s."
+        )
+        round_attack_stats[round_name] = {
+            "pool_size": len(points), "counterexamples_found": round_ce_count,
+            "counterexample_rate": rate, "time_seconds": float(elapsed),
+        }
+        return ce_records
+
+    # ---------------- Round 1: broad probe over all candidate neurons ----------------
+    phase1_start = time.time()
+    print(
+        f"[PatternSearchPGD] Round 1: broad probe over {all_indices.numel()} candidate neurons, "
+        f"{args.collect_iterations} attempts (min pairwise Hamming distance {args.min_diversity_hamming})..."
+    )
+    round1_attempts = collect_round("round1", args.collect_iterations, args.collect_timeout, all_indices)
+    round1_pool_size = len(pool_points)
+    print(f"[PatternSearchPGD] Round 1 done: {round1_pool_size} points kept out of {round1_attempts} attempts.")
+    attack_phase(pool_points[:round1_pool_size], "round1")
+
+    # ---------------- Round 2: empirically-focused probe (opt-in) ----------------
+    round2_attempts = 0
+    round3_attempts = 0
+    round2_pool_size = round1_pool_size
+    round2_ce_records: list[tuple[torch.Tensor, torch.Tensor]] = []
+    if args.round2_iterations > 0:
+        stacked = torch.stack(pool_patterns, dim=0) if pool_patterns else None
+        if stacked is not None:
+            active_frac = (stacked > 0).float().mean(dim=0)
+            empirically_variable = ((active_frac > 0.001) & (active_frac < 0.999)).nonzero(as_tuple=True)[0]
+            round2_candidates = (
+                all_indices[torch.isin(all_indices, empirically_variable)]
+                if empirically_variable.numel() else all_indices
+            )
+            if round2_candidates.numel() == 0:
+                print("[PatternSearchPGD] Round 1 found no neurons that ever varied; round 2 falls back to "
+                      "round 1's full candidate set.")
+                round2_candidates = all_indices
+            print(
+                f"[PatternSearchPGD] Round 1 empirically found {round2_candidates.numel()}/{all_indices.numel()} "
+                f"candidate neurons that actually flip at least once -- round 2 restricts flip candidates to "
+                f"just these for {args.round2_iterations} more attempts."
+            )
+            round2_attempts = collect_round("round2", args.round2_iterations, args.collect_timeout, round2_candidates)
+            round2_pool_size = len(pool_points)
+            print(
+                f"[PatternSearchPGD] Round 2 done: {round2_pool_size - round1_pool_size} new points kept out of "
+                f"{round2_attempts} attempts (pool now {round2_pool_size} total)."
+            )
+            round2_ce_records = attack_phase(pool_points[round1_pool_size:round2_pool_size], "round2")
+
+            # ---------------- Round 3: anchor pull-back (opt-in, needs a round-2 CE) ----------------
+            if args.round3_iterations > 0:
+                if round2_ce_records:
+                    print(
+                        f"[PatternSearchPGD] Round 3: gradient-walking near {len(round2_ce_records)} round2 "
+                        f"counterexamples (stop once Hamming distance to that anchor's own pattern <= "
+                        f"{args.round3_hamming_radius}), {args.round3_iterations} attempts..."
+                    )
+                    round3_pool_start = len(pool_points)
+                    width = (ub - lb).clamp(min=0)
+                    step_size = args.pattern_step_size
+                    if step_size is None:
+                        step_size = max(float(width.abs().max().item()) / max(args.pattern_steps, 1), 1e-6)
+
+                    round_start = time.time()
+                    made = 0
+                    while made < args.round3_iterations:
+                        if time.time() - round_start >= args.collect_timeout:
+                            print(f"[PatternSearchPGD] round3 timeout reached after {made} attempts.")
+                            break
+                        made += 1
+
+                        anchor_idx = random.randrange(len(round2_ce_records))
+                        anchor_input, anchor_pattern = round2_ce_records[anchor_idx]
+
+                        # Small random perturbation first: starting exactly at the anchor gives zero
+                        # margin-loss gradient (it already matches its own pattern perfectly), so nudge
+                        # it off that point before gradient-walking back toward (near) the same pattern.
+                        noise = (torch.rand_like(anchor_input) * 2 - 1) * args.round3_noise_scale * width
+                        x = torch.max(torch.min(anchor_input + noise, ub), lb)
+
+                        noise_hamming = None
+                        steps_used = args.pattern_steps
+                        broke_early = False
+                        for step_i in range(args.pattern_steps):
+                            x_req = x.detach().clone().requires_grad_(True)
+                            z_all = _relu_preactivations(wrapped_model, x_req)
+                            achieved_sign = torch.where(z_all.detach() > 0, torch.ones_like(z_all), -torch.ones_like(z_all))
+                            hamming_now = int((achieved_sign[0] != anchor_pattern).sum().item())
+                            if step_i == 0:
+                                noise_hamming = hamming_now
+                            if hamming_now <= args.round3_hamming_radius:
+                                steps_used = step_i
+                                broke_early = True
+                                break
+                            violation = (args.pattern_margin - anchor_pattern.unsqueeze(0) * z_all).clamp(min=0)
+                            loss = violation.sum()
+                            grad = torch.autograd.grad(loss, x_req)[0]
+                            x = x_req.detach() - step_size * torch.sign(grad)
+                            x = torch.max(torch.min(x, ub), lb)
+                        x = x.detach()
+
+                        achieved_pattern = _relu_sign_pattern(wrapped_model, x)
+                        final_hamming_to_anchor = int((achieved_pattern != anchor_pattern).sum().item())
+                        # Round 3 deliberately does NOT dedup against the tree: the whole point is to
+                        # densely sample the neighborhood of known-good patterns, so near-duplicates are
+                        # expected and wanted, not noise to filter out.
+                        pool_points.append(x)
+                        pool_patterns.append(achieved_pattern)
+
+                        collect_rows.append({
+                            "round": "round3", "attempt": made, "kept": True, "pool_size_after": len(pool_points),
+                            "noise_hamming": noise_hamming, "steps_used": steps_used, "broke_early": broke_early,
+                            "final_hamming_to_anchor": final_hamming_to_anchor,
+                        })
+                        if args.report_interval > 0 and made % args.report_interval == 0:
+                            print(f"[PatternSearchPGD] round3 attempts={made}/{args.round3_iterations}, "
+                                  f"pool_size={len(pool_points)}")
+
+                    round3_attempts = made
+                    round3_pool_size = len(pool_points)
+                    print(
+                        f"[PatternSearchPGD] Round 3 done: {round3_pool_size - round3_pool_start} new points kept "
+                        f"out of {round3_attempts} attempts (pool now {round3_pool_size} total)."
+                    )
+
+                    round3_rows = [r for r in collect_rows if r["round"] == "round3"]
+                    if round3_rows:
+                        hit = [r["final_hamming_to_anchor"] <= args.round3_hamming_radius for r in round3_rows]
+                        hit_steps = sorted(r["steps_used"] for r, h in zip(round3_rows, hit) if h)
+                        miss_steps = sorted(r["steps_used"] for r, h in zip(round3_rows, hit) if not h)
+                        hit_count = sum(hit)
+                        print(
+                            f"[PatternSearchPGD] Round 3 hit-rate: {hit_count}/{len(round3_rows)} "
+                            f"({100.0 * hit_count / len(round3_rows):.1f}%) reached hamming<="
+                            f"{args.round3_hamming_radius} within --pattern-steps={args.pattern_steps}. "
+                            f"steps_used -- hits: median={statistics.median(hit_steps) if hit_steps else float('nan'):.0f}, "
+                            f"misses: median={statistics.median(miss_steps) if miss_steps else float('nan'):.0f}."
+                        )
+                    attack_phase(pool_points[round3_pool_start:round3_pool_size], "round3")
+                else:
+                    print("[PatternSearchPGD] Round 2 found no counterexamples; skipping round 3 (nothing to "
+                          "build nearby patterns from).")
+        else:
+            print("[PatternSearchPGD] Round 1 produced an empty pool; skipping round 2.")
 
     phase1_time = time.time() - phase1_start
+    total_attempts = round1_attempts + round2_attempts + round3_attempts
+    counterexamples = all_counterexamples
+    phase2_time = sum(stats["time_seconds"] for stats in round_attack_stats.values())
     print(
-        f"[PatternSearchPGD] Phase 1 done: {len(pool_points)} diverse points kept out of "
-        f"{attempts} attempts in {phase1_time:.1f}s."
+        f"[PatternSearchPGD] All rounds done: {len(pool_points)} points kept out of {total_attempts} attempts, "
+        f"{len(counterexamples)} counterexample(s) total, in {phase1_time:.1f}s."
     )
 
-    # ---------------- Phase 2: real attack-loss PGD ----------------
-    counterexamples: list[Counterexample] = []
-    saved_ce_count = 0
-    phase2_start = time.time()
+    collect_csv_path = output_dir / "pattern_search_phase1_collect.csv"
+    with open(collect_csv_path, "w", newline="", encoding="utf-8") as f:
+        if collect_rows:
+            fieldnames: list[str] = []
+            for row in collect_rows:
+                for key in row.keys():
+                    if key not in fieldnames:
+                        fieldnames.append(key)
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(collect_rows)
+        else:
+            f.write("round,attempt,kept,pool_size_after,flip_retry_count\n")
 
-    for i, point in enumerate(pool_points):
-        adv_input = _attack_pgd(
-            point, wrapped_model, lb, ub, output_spec, label, args.pgd_steps, args.pgd_step_size,
-        )
-        with torch.no_grad():
-            out = wrapped_model(adv_input)
-            outputs = out["output"] if isinstance(out, dict) else out
-        seeds = FuzzingSeed(
-            tensor=adv_input,
-            original_tensor=point,
-            original_index=torch.zeros(1, dtype=torch.long, device=device),
-            label=label,
-        )
-        violation_mask, batch_ces = checker.check(inputs=adv_input, outputs=outputs, seeds=seeds)
-        if bool(violation_mask[0].item()):
-            for ce in batch_ces:
-                counterexamples.append(ce)
-                if not args.no_save:
-                    ce.save(output_dir / f"ce_{saved_ce_count + 1}.pt")
-                saved_ce_count += 1
-
-        if args.report_interval > 0 and (i + 1) % args.report_interval == 0:
-            print(
-                f"[PatternSearchPGD] phase2 attacked={i + 1}/{len(pool_points)}, "
-                f"counterexamples={len(counterexamples)}"
-            )
-
-    phase2_time = time.time() - phase2_start
-    print(
-        f"[PatternSearchPGD] Phase 2 done: {len(counterexamples)}/{len(pool_points)} counterexamples "
-        f"in {phase2_time:.1f}s."
-    )
+    attack_csv_path = output_dir / "pattern_search_phase2_attack.csv"
+    with open(attack_csv_path, "w", newline="", encoding="utf-8") as f:
+        if all_attack_rows:
+            writer = csv.DictWriter(f, fieldnames=list(all_attack_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_attack_rows)
+        else:
+            f.write("round,pool_index,is_counterexample,violation_score\n")
 
     summary = {
         "category": args.category,
         "instance_id": str(instance_id),
         "model_id": str(model_id),
         "total_relu_neurons": total_relu_neurons,
-        "phase1_attempts": attempts,
+        "round1_attempts": round1_attempts,
+        "round1_pool_size": round1_pool_size,
+        "round2_attempts": round2_attempts,
+        "round2_pool_size": round2_pool_size,
+        "round3_attempts": round3_attempts,
+        "phase1_attempts": total_attempts,
         "phase1_time_seconds": phase1_time,
         "pool_size": len(pool_points),
         "phase2_time_seconds": phase2_time,
         "counterexamples_found": len(counterexamples),
+        "round_attack_stats": round_attack_stats,
+        "phase1_csv": str(collect_csv_path),
+        "phase2_csv": str(attack_csv_path),
         "params": {k: v for k, v in vars(args).items()},
     }
     summary_path = output_dir / "pattern_search_pgd_summary.json"
@@ -453,10 +673,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--collect-iterations", type=int, default=200,
         help="Phase 1: number of independent random-flip projection attempts to make.",
     )
-    parser.add_argument("--collect-timeout", type=float, default=300.0, help="Phase 1: wall-clock budget in seconds.")
+    parser.add_argument("--collect-timeout", type=float, default=300.0, help="Wall-clock budget per round, in seconds.")
     parser.add_argument(
         "--pool-target", type=int, default=0,
-        help="Phase 1: stop early once this many diverse points have been kept (0 = disabled).",
+        help="Stop a collection round early once this many diverse points have been kept overall (0 = disabled).",
+    )
+    parser.add_argument(
+        "--round2-iterations", type=int, default=0,
+        help="Round 2: number of additional attempts, using flip candidates restricted to just the neurons "
+        "round 1 empirically found to actually flip at least once. 0 (default) = single-round, skip round 2.",
+    )
+    parser.add_argument(
+        "--round3-iterations", type=int, default=0,
+        help="Round 3: number of additional attempts (only runs if round 2 found at least one real "
+        "counterexample). Each attempt anchors on a random round-2 counterexample's own (input, achieved "
+        "pattern), nudges the input by --round3-noise-scale, then gradient-walks back toward the anchor's "
+        "own pattern until within --round3-hamming-radius. 0 (default) = skip round 3.",
+    )
+    parser.add_argument(
+        "--round3-hamming-radius", type=int, default=3,
+        help="Round 3: stop the gradient walk back toward an anchor's pattern as soon as the achieved "
+        "Hamming distance to it is <= this value.",
+    )
+    parser.add_argument(
+        "--round3-noise-scale", type=float, default=0.05,
+        help="Round 3: initial random perturbation applied to an anchor counterexample's input, as a "
+        "fraction of the input box width per dimension, before gradient-walking back toward its pattern.",
     )
     parser.add_argument(
         "--flip-count", type=int, default=10,
