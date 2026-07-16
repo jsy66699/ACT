@@ -325,15 +325,27 @@ class HPGDMutation(MutationStrategy):
     state" first-pass version; MutationEngine's post-mutate InputSpec
     projection still applies afterward like every other strategy.
 
-    After mutate() returns, `last_new_state_mask` records, per sample,
-    whether the ACHIEVED pattern is one this instance has not produced
-    before -- an exact-match dedup via a hash set of pattern bytes, not a
-    Hamming-distance diversity check. This will later be replaced by a
-    BK-tree-based state manager; for now, ACTFuzzer reads this mask to
-    decide corpus admission and energy for the "hpgd" strategy specifically,
-    deliberately NOT consulting CoverageTracker's own interestingness
-    signal here (coverage keeps being computed as normal for every
-    strategy; HPGD just doesn't use it to gate seed admission).
+    Flip-candidate selection:
+      - `candidate_indices` (optional): restrict which neurons are eligible
+        to flip (e.g. only the instance's unstable ReLUs, from
+        act.pipeline.fuzzing.state_manager.compute_unstable_mask). None =
+        every neuron is a candidate. Sampling K candidates out of a
+        restricted set (rather than out of every neuron in the network) is
+        also what keeps this tractable on CNN-sized networks, where most
+        neurons are typically stable and irrelevant to flip anyway.
+      - `flip_weights` (optional, settable per call like `perturb_size`):
+        per-candidate sampling weight, shape [C] (shared across the batch)
+        or [B, C] (per sample -- e.g. PatternStateManager.local_bias(),
+        biasing toward neurons that recently proved flippable from that
+        specific seed). None = uniform random choice among candidates.
+
+    After mutate() returns, `last_natural_pattern`/`last_achieved_pattern`
+    hold the full (unrestricted) pre- and post-mutation ReLU sign patterns,
+    for the caller to do its own novelty/diversity bookkeeping and
+    local-bias updates via PatternStateManager -- HPGD itself no longer
+    keeps its own dedup set; that used to be a plain hash set here, but is
+    now PatternStateManager's job (Bloom filter + BK-tree, fixed memory
+    instead of growing with every distinct pattern seen).
     """
 
     def __init__(
@@ -343,6 +355,7 @@ class HPGDMutation(MutationStrategy):
         num_steps: int = 10,
         step_size: Optional[float] = None,
         margin: float = 0.01,
+        candidate_indices: Optional[torch.Tensor] = None,
     ):
         """
         Initialize HPGD mutation.
@@ -354,14 +367,18 @@ class HPGDMutation(MutationStrategy):
             step_size: Per-step size (if None, computed from the feasible box range / steps)
             margin: Hinge-loss margin -- a neuron counts as "matching" the target once its
                 signed pre-activation clears this margin
+            candidate_indices: Optional 1-D LongTensor restricting which neurons may be
+                flipped (e.g. unstable-only). None = every neuron is a candidate.
         """
         self.perturb_size = perturb_size
         self.flip_count = int(flip_count)
         self.num_steps = int(num_steps)
         self.step_size = step_size
         self.margin = float(margin)
-        self._seen_states: set = set()
-        self.last_new_state_mask: Optional[torch.Tensor] = None
+        self.candidate_indices = candidate_indices
+        self.flip_weights: Optional[torch.Tensor] = None
+        self.last_natural_pattern: Optional[torch.Tensor] = None
+        self.last_achieved_pattern: Optional[torch.Tensor] = None
 
     def mutate(self, input_tensor, model, activations=None, label=None):
         """Apply HPGD mutation.
@@ -382,13 +399,26 @@ class HPGDMutation(MutationStrategy):
 
         natural_pattern = _relu_sign_pattern_batched(model, x0)
         num_neurons = natural_pattern.shape[1]
+        candidates = (
+            self.candidate_indices.to(device) if self.candidate_indices is not None
+            else torch.arange(num_neurons, device=device)
+        )
+        C = candidates.numel()
 
         target_pattern = natural_pattern.clone()
-        k = min(self.flip_count, num_neurons)
+        k = min(self.flip_count, C)
         if k > 0:
-            for b in range(B):
-                flip_idx = torch.randperm(num_neurons, device=device)[:k]
-                target_pattern[b, flip_idx] *= -1
+            if self.flip_weights is not None:
+                weights = self.flip_weights.to(device)
+                if weights.dim() == 1:
+                    weights = weights.unsqueeze(0).expand(B, -1)
+                for b in range(B):
+                    local_idx = torch.multinomial(weights[b].clamp(min=1e-8), k, replacement=False)
+                    target_pattern[b, candidates[local_idx]] *= -1
+            else:
+                for b in range(B):
+                    local_idx = torch.randperm(C, device=device)[:k]
+                    target_pattern[b, candidates[local_idx]] *= -1
 
         perturb_size = self.perturb_size.to(device) if isinstance(self.perturb_size, torch.Tensor) else self.perturb_size
         x_low = x0 - perturb_size
@@ -413,14 +443,112 @@ class HPGDMutation(MutationStrategy):
             x = torch.max(torch.min(x, x_high), x_low).detach()
 
         achieved_pattern = _relu_sign_pattern_batched(model, x)
-        new_mask = torch.zeros(B, dtype=torch.bool, device=device)
-        for b in range(B):
-            key = achieved_pattern[b].to(torch.int8).cpu().numpy().tobytes()
-            if key not in self._seen_states:
-                self._seen_states.add(key)
-                new_mask[b] = True
-        self.last_new_state_mask = new_mask
+        self.last_natural_pattern = natural_pattern
+        self.last_achieved_pattern = achieved_pattern
 
+        return x.detach()
+
+
+class HPGDPullbackMutation(MutationStrategy):
+    """
+    HPGD pull-back: the GCE (generate-counterexample) counterpart to
+    HPGDMutation, adapted from PatternSearchPGD's round 3. Given a batch of
+    ANCHOR patterns (typically confirmed counterexamples' own achieved
+    patterns, from PatternStateManager.pick_ce_seeds), nudges each seed with
+    a small random perturbation and then hinge-loss gradient-walks it back
+    toward its OWN anchor pattern -- densely resampling the neighborhood of
+    a known-violating region instead of exploring blindly. Stops each
+    sample independently once its Hamming distance to its own anchor is
+    <= `hamming_radius`.
+
+    Unlike every other strategy, this one needs external per-sample state
+    (the anchors) that MutationEngine's uniform interface has no slot for,
+    so it is not registered in MutationEngine.strategies / driven by
+    weighted strategy selection -- the GCE task in ACTFuzzer calls
+    `set_anchors()` then `mutate()` on it directly.
+    """
+
+    def __init__(
+        self,
+        num_steps: int = 10,
+        step_size: Optional[float] = None,
+        margin: float = 0.01,
+        hamming_radius: int = 3,
+        noise_scale: float = 0.05,
+    ):
+        """
+        Args:
+            num_steps: Number of hinge-loss sign-gradient steps
+            step_size: Per-step size (if None, derived from noise_scale / num_steps)
+            margin: Hinge-loss margin, same meaning as HPGDMutation's
+            hamming_radius: Stop a sample's gradient walk once its achieved pattern is
+                within this many neurons of its own anchor pattern
+            noise_scale: Initial random perturbation magnitude applied to each anchor
+                input before gradient-walking back -- starting exactly at the anchor
+                gives zero margin-loss gradient (nothing to fix)
+        """
+        self.num_steps = int(num_steps)
+        self.step_size = step_size
+        self.margin = float(margin)
+        self.hamming_radius = int(hamming_radius)
+        self.noise_scale = float(noise_scale)
+        self._anchor_patterns: Optional[torch.Tensor] = None
+        self.last_final_hamming: Optional[torch.Tensor] = None
+
+    def set_anchors(self, anchor_patterns: torch.Tensor) -> None:
+        """anchor_patterns: [B, N] full (unrestricted) ReLU sign patterns,
+        one per sample in the next mutate() call's batch."""
+        self._anchor_patterns = anchor_patterns
+
+    def mutate(self, input_tensor, model, activations=None, label=None):
+        """Apply HPGD pull-back mutation. `set_anchors()` must be called first.
+
+        Args:
+            input_tensor: Anchor seed input tensor [B, ...] (the CE inputs themselves)
+            model: Model for gradient computation
+            activations: Unused
+            label: Unused -- pattern-driven, not label-driven
+
+        Returns:
+            Mutated input tensor [B, ...], nudged off each anchor and gradient-walked
+            back toward it.
+        """
+        if self._anchor_patterns is None:
+            raise RuntimeError("HPGDPullbackMutation.set_anchors() must be called before mutate().")
+        x0 = input_tensor.detach()
+        B = x0.shape[0]
+        device = x0.device
+        anchor = self._anchor_patterns.to(device)
+
+        noise = (torch.rand_like(x0) * 2 - 1) * self.noise_scale
+        x = (x0 + noise).detach()
+
+        step_size = self.step_size
+        if step_size is None:
+            step_size = max(self.noise_scale / max(self.num_steps, 1), 1e-6)
+        else:
+            step_size = float(step_size)
+
+        final_hamming = torch.zeros(B, dtype=torch.long, device=device)
+        broadcast_shape = (B,) + (1,) * (x0.dim() - 1)
+        for _ in range(self.num_steps):
+            x_req = x.detach().clone().requires_grad_(True)
+            z_all = _relu_preactivations_batched(model, x_req)
+            achieved_sign = torch.where(z_all.detach() > 0, torch.ones_like(z_all), -torch.ones_like(z_all))
+            hamming_now = (achieved_sign != anchor).sum(dim=1)
+            final_hamming = hamming_now
+            done = hamming_now <= self.hamming_radius
+            if bool(done.all().item()):
+                break
+            violation = (self.margin - anchor * z_all).clamp(min=0)
+            loss = violation.sum()
+            grad = torch.autograd.grad(loss, x_req, retain_graph=False, create_graph=False)[0].detach()
+            stepped = (x_req.detach() - step_size * torch.sign(grad)).detach()
+            # Only samples that haven't converged yet keep moving, so ones
+            # already close to their own anchor don't drift back away from it.
+            x = torch.where(done.view(*broadcast_shape), x, stepped)
+
+        self.last_final_hamming = final_hamming
         return x.detach()
 
 

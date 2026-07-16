@@ -67,6 +67,42 @@ fuzzing:
   # time-to-first-counterexample).
   stop_on_first_violation: false
 
+  # -- PatternStateManager (global BK-tree/Bloom-filter state tracking) --
+  # Off by default: admission_mode="coverage" + scheduling_mode="energy" is
+  # byte-for-byte the original fuzzer (CoverageTracker + SeedCorpus energy).
+  # admission_mode: "coverage" (default) | "state" (PatternStateManager
+  #   novelty/diversity over the unstable-ReLU subspace decides corpus
+  #   admission/energy for EVERY strategy, not just "hpgd")
+  admission_mode: "coverage"
+  # scheduling_mode: "energy" (default, SeedCorpus.select()) | "sparse"
+  #   (PatternStateManager.pick_seeds(), density-weighted x energy-blended)
+  scheduling_mode: "energy"
+  # enable_bi_gce: run BI (broad, sparsity-guided explore) and GCE (anchor
+  #   pull-back near a confirmed counterexample, PatternSearchPGD round-3
+  #   style) as two sequential batched sub-iterations per outer iteration,
+  #   sharing one PatternStateManager/corpus. GCE idles until BI (or any
+  #   strategy) finds the first counterexample. Implies a PatternStateManager
+  #   is built even if admission_mode/scheduling_mode are left at defaults.
+  enable_bi_gce: false
+  bi_batch_size: 0   # 0 = use the normal (model-synthesis) batch size
+  gce_batch_size: 0  # 0 = same as bi_batch_size
+  # PatternStateManager tuning (only read when admission_mode="state",
+  # scheduling_mode="sparse", or enable_bi_gce=true).
+  state_diversity_threshold: 1     # min Hamming distance (unstable subspace) between kept states
+  state_bloom_bits: 1048576        # fixed-memory approximate-novelty pre-check width
+  state_bloom_hashes: 4
+  state_local_bias_high: 10.0      # HPGD flip-candidate weight for "just proved flippable from this seed"
+  state_local_bias_low: 0.1        # HPGD flip-candidate weight for the rest of the unstable set
+  # HPGD (the "hpgd" mutation_weights strategy) tuning.
+  hpgd_flip_count: 10
+  hpgd_num_steps: 10
+  hpgd_margin: 0.01
+  # GCE (HPGDPullbackMutation) tuning.
+  gce_num_steps: 10
+  gce_margin: 0.01
+  gce_hamming_radius: 3
+  gce_noise_scale: 0.05
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Verification  (Branch-and-Bound)
 # ─────────────────────────────────────────────────────────────────────────────

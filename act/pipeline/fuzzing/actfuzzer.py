@@ -22,7 +22,7 @@ from pathlib import Path
 from act.front_end.specs import InputSpec, OutputSpec
 from act.front_end.spec_creator_base import LabeledInputTensor
 from act.front_end.verifiable_model import InputSpecLayer, OutputSpecLayer
-from act.pipeline.fuzzing.mutations import MutationEngine
+from act.pipeline.fuzzing.mutations import MutationEngine, _relu_sign_pattern_batched
 from act.pipeline.fuzzing.coverage import CoverageTracker
 from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
 from act.pipeline.fuzzing.checker import Counterexample, PropertyChecker
@@ -101,6 +101,42 @@ class FuzzingConfig:
     # Stop as soon as the first counterexample is found (for a fast pre-attack:
     # total_time then measures time-to-first-counterexample). Default off.
     stop_on_first_violation: bool = False
+
+    # -- PatternStateManager (global BK-tree/Bloom-filter state tracking) --
+    # admission_mode: "coverage" (default, original behavior unchanged) uses
+    #   CoverageTracker's neuron-activation interestingness for every
+    #   strategy, exactly as before this feature existed.
+    #   "state" replaces that, for every strategy, with PatternStateManager's
+    #   novelty/diversity check over the unstable-ReLU subspace (energy 10 on
+    #   admission, same as coverage-interesting did).
+    admission_mode: str = "coverage"
+    # scheduling_mode: "energy" (default, original behavior) keeps
+    #   SeedCorpus's own energy-weighted select(). "sparse" instead draws
+    #   seeds from PatternStateManager.pick_seeds() (density-weighted,
+    #   optionally blended with each seed's energy_bonus).
+    scheduling_mode: str = "energy"
+    # BI (explore, density-guided) / GCE (exploit, anchor pull-back near a
+    # known counterexample) two-task loop, sharing one PatternStateManager.
+    # Off by default -- when off, fuzz() is the original single-phase loop.
+    enable_bi_gce: bool = False
+    bi_batch_size: int = 0   # 0 = use the normal (model-synthesis) batch size
+    gce_batch_size: int = 0  # 0 = same as bi_batch_size
+    # PatternStateManager tuning (only used when admission_mode=="state",
+    # scheduling_mode=="sparse", or enable_bi_gce=True).
+    state_diversity_threshold: int = 1
+    state_bloom_bits: int = 1 << 20
+    state_bloom_hashes: int = 4
+    state_local_bias_high: float = 10.0
+    state_local_bias_low: float = 0.1
+    # HPGD tuning (the "hpgd" MutationEngine strategy).
+    hpgd_flip_count: int = 10
+    hpgd_num_steps: int = 10
+    hpgd_margin: float = 0.01
+    # GCE (HPGDPullbackMutation) tuning.
+    gce_num_steps: int = 10
+    gce_margin: float = 0.01
+    gce_hamming_radius: int = 3
+    gce_noise_scale: float = 0.05
 
     def __post_init__(self):
         """Normalize output_dir to Path object."""
@@ -275,6 +311,20 @@ class ACTFuzzer:
             initial_seeds=initial_seeds, strategy=self.config.seed_selection_strategy
         )
 
+        # PatternStateManager: only built when actually needed (admission_mode
+        # "state", scheduling_mode "sparse", or BI/GCE), so the default
+        # "coverage" + "energy" configuration pays zero extra cost and is
+        # byte-for-byte the original fuzzer.
+        self.state_manager = None
+        self.gce_mutation = None
+        needs_state_manager = (
+            self.config.admission_mode == "state"
+            or self.config.scheduling_mode == "sparse"
+            or self.config.enable_bi_gce
+        )
+        if needs_state_manager:
+            self._init_state_manager(initial_seeds)
+
         # Initialize tracer (only if trace_level > 0)
         if self.config.trace_level > 0:
             from act.pipeline.fuzzing.tracer import ExecutionTracer
@@ -327,6 +377,90 @@ class ACTFuzzer:
                 return cast(InputSpec | OutputSpec, cast(object, layer.spec))
         return None
 
+    def _init_state_manager(self, initial_seeds: List[LabeledInputTensor]) -> None:
+        """Build PatternStateManager: compute the instance's unstable-ReLU
+        mask (via act.back_end interval bound propagation, falling back to
+        "every neuron is a candidate" if that fails for any reason -- e.g.
+        an unsupported layer type), wire it into the "hpgd" strategy's flip
+        candidates, and construct the GCE pull-back mutation."""
+        from act.pipeline.fuzzing.mutations import HPGDPullbackMutation, _relu_preactivations_batched
+        from act.pipeline.fuzzing.state_manager import PatternStateManager, compute_unstable_mask
+
+        sample = initial_seeds[0].tensor.to(self.device)
+        with torch.no_grad():
+            total_neurons = int(_relu_preactivations_batched(self.model, sample).shape[1])
+
+        unstable_mask = None
+        if self.input_spec is not None:
+            try:
+                lb, ub = self.input_spec.materialize_box_seed()
+                unstable_mask = compute_unstable_mask(self.model, lb.to(self.device)[:1], ub.to(self.device)[:1])
+            except Exception:
+                unstable_mask = None
+
+        self.state_manager = PatternStateManager(
+            unstable_mask=unstable_mask,
+            total_neurons=total_neurons,
+            diversity_threshold=self.config.state_diversity_threshold,
+            bloom_bits=self.config.state_bloom_bits,
+            bloom_hashes=self.config.state_bloom_hashes,
+            local_bias_high=self.config.state_local_bias_high,
+            local_bias_low=self.config.state_local_bias_low,
+            device=self.device,
+        )
+
+        hpgd = self.mutation_engine.strategies.get("hpgd")
+        if hpgd is not None:
+            hpgd.candidate_indices = self.state_manager.candidate_indices
+            hpgd.flip_count = self.config.hpgd_flip_count
+            hpgd.num_steps = self.config.hpgd_num_steps
+            hpgd.margin = self.config.hpgd_margin
+
+        if self.config.enable_bi_gce:
+            self.gce_mutation = HPGDPullbackMutation(
+                num_steps=self.config.gce_num_steps,
+                margin=self.config.gce_margin,
+                hamming_radius=self.config.gce_hamming_radius,
+                noise_scale=self.config.gce_noise_scale,
+            )
+
+    def _observe_state(
+        self,
+        parent_seeds: "FuzzingSeed",
+        child_inputs: torch.Tensor,
+        natural_pattern: torch.Tensor,
+        achieved_pattern: torch.Tensor,
+        violation_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Feed a batch of mutation results (regardless of which strategy
+        produced them) into PatternStateManager: admits each sample whose
+        achieved pattern is novel/diverse enough, records it (and, for
+        confirmed violations, as a GCE anchor), and updates that new seed's
+        local_bias from the positions that actually flipped. Returns the
+        per-sample admitted BoolTensor[B], for the caller to use as (or
+        fold into) interesting_mask."""
+        assert self.state_manager is not None
+        B = child_inputs.shape[0]
+        admitted = torch.zeros(B, dtype=torch.bool, device=child_inputs.device)
+        for b in range(B):
+            is_ce = bool(violation_mask[b].item())
+            ok = self.state_manager.observe(
+                seed_tensor=child_inputs[b : b + 1],
+                pattern_full=achieved_pattern[b : b + 1],
+                label=parent_seeds.label[b : b + 1],
+                original_tensor=parent_seeds.original_tensor[b : b + 1],
+                original_index=parent_seeds.original_index[b : b + 1],
+                is_ce=is_ce,
+                energy_bonus=(5.0 if is_ce else 1.0),
+            )
+            admitted[b] = ok
+            if ok:
+                restricted_natural = self.state_manager.restrict(natural_pattern[b])
+                restricted_achieved = self.state_manager.restrict(achieved_pattern[b])
+                flipped = (restricted_natural != restricted_achieved).nonzero(as_tuple=True)[0]
+                self.state_manager.update_local_bias(child_inputs[b : b + 1], flipped)
+        return admitted
+
     def fuzz(self) -> FuzzingReport:
         """
         Main fuzzing loop.
@@ -355,11 +489,20 @@ class ACTFuzzer:
                 print(f"⏱️  Timeout reached after {iteration} iterations")
                 break
 
-            # Always use full batch size to match VerifiableModel's spec layer dimensions.
-            # The wrapped model's InputSpecLayer has bounds sized [N, ...] from model synthesis,
-            # so every forward pass must use exactly N inputs.
-            self._fuzz_iteration(iteration, batch_size)
-            iteration += batch_size
+            # Batch size normally must match VerifiableModel's spec layer dimensions
+            # (InputSpecLayer bounds are sized [N, ...] from model synthesis), but
+            # MutationEngine._project() gathers bounds per-sample via
+            # seeds.original_index, so an independently-sized BI/GCE batch (see
+            # bi_batch_size/gce_batch_size) is still projected correctly.
+            bi_bs = self.config.bi_batch_size or batch_size if self.config.enable_bi_gce else batch_size
+            self._fuzz_iteration(iteration, bi_bs)
+            if self.config.enable_bi_gce:
+                # GCE rides alongside BI's iteration, sharing the same
+                # PatternStateManager/corpus; it idles until a counterexample
+                # exists to anchor on. It does not consume its own iteration budget.
+                gce_bs = self.config.gce_batch_size or bi_bs
+                self._gce_iteration(iteration, gce_bs)
+            iteration += bi_bs
 
             if self.config.stop_on_first_violation and self.counterexamples:
                 print(f"✋ First counterexample at {time.time() - self.start_time:.3f}s; stopping")
@@ -380,8 +523,27 @@ class ACTFuzzer:
             start_iteration: Starting iteration number
             batch_size: Number of samples to process
         """
-        # 1. select — returns FuzzingSeed batch (B=batch_size)
-        seeds: FuzzingSeed = self.seed_corpus.select(batch_size)
+        # 1. select — returns FuzzingSeed batch (B=batch_size). "sparse"
+        # scheduling draws density-weighted seeds from PatternStateManager
+        # instead of SeedCorpus's energy-weighted select(); falls back to
+        # the normal corpus (e.g. before any state has been recorded yet).
+        if (
+            self.config.scheduling_mode == "sparse"
+            and self.state_manager is not None
+            and len(self.state_manager) > 0
+        ):
+            payloads = self.state_manager.pick_seeds(batch_size, use_energy=True)
+            seeds: FuzzingSeed = self.state_manager.seeds_to_batch(payloads)
+        else:
+            seeds = self.seed_corpus.select(batch_size)
+
+        # PatternStateManager admission needs the PRE-mutation pattern to
+        # later diff against the achieved one (which candidate neurons this
+        # specific mutation actually flipped, for local_bias).
+        natural_pattern = None
+        if self.config.admission_mode == "state" and self.state_manager is not None:
+            with torch.no_grad():
+                natural_pattern = _relu_sign_pattern_batched(self.model, seeds.tensor.to(self.device))
 
         # 2. mutate — takes FuzzingSeed, returns Tensor[B, ...]
         inputs = self.mutation_engine.mutate(seeds)
@@ -410,17 +572,19 @@ class ACTFuzzer:
         self.coverage_tracker.update(inputs, activations, strategy=_other)
 
         # 6. energy computation (fully vectorized)
-        # HPGD is pattern-driven, not coverage-driven: a mutated sample is
-        # "interesting" iff it reached a ReLU sign pattern this run hasn't
-        # produced before (HPGDMutation.last_new_state_mask), not iff
-        # CoverageTracker judged it interesting. Every other strategy keeps
-        # the original coverage-gated behavior unchanged.
-        if self.mutation_engine.last_strategy == "hpgd":
-            new_state_mask = self.mutation_engine.strategies["hpgd"].last_new_state_mask
-            if new_state_mask is None:
-                new_state_mask = torch.zeros(batch_size, dtype=torch.bool, device=inputs.device)
-            interesting_mask = violation_mask | new_state_mask
-            energies = new_state_mask.float() * 10.0 + violation_mask.float() * 100.0
+        # admission_mode "state" (any strategy, not just HPGD): a mutated
+        # sample is "interesting" iff PatternStateManager judges its
+        # achieved ReLU-sign pattern novel/diverse enough (Bloom filter +
+        # BK-tree over the unstable subspace) -- CoverageTracker's own
+        # per-neuron-ever-activated signal (cov_interesting, still computed
+        # above) is not consulted. admission_mode "coverage" (default)
+        # keeps the original behavior unchanged for every strategy.
+        if self.config.admission_mode == "state" and self.state_manager is not None:
+            with torch.no_grad():
+                achieved_pattern = _relu_sign_pattern_batched(self.model, inputs)
+            admitted = self._observe_state(seeds, inputs, natural_pattern, achieved_pattern, violation_mask)
+            interesting_mask = violation_mask | admitted
+            energies = admitted.float() * 10.0 + violation_mask.float() * 100.0
         else:
             interesting_mask = violation_mask | cov_interesting
             energies = cov_interesting.float() * 10.0 + violation_mask.float() * 100.0
@@ -489,6 +653,66 @@ class ACTFuzzer:
                     )
 
         self.iterations = start_iteration + batch_size
+
+    def _gce_iteration(self, start_iteration: int, batch_size: int) -> None:
+        """GCE (generate-counterexample) phase: HPGDPullbackMutation anchored
+        on confirmed counterexamples already recorded in PatternStateManager
+        (found by BI or by whichever strategy admitted them). Idles (no-op)
+        until at least one counterexample exists -- mirrors
+        PatternSearchPGD's round 3 only running once round 2 found a real
+        counterexample. Rides alongside BI's iteration budget rather than
+        consuming its own (see fuzz()); does not feed the execution tracer.
+        """
+        if self.state_manager is None or self.gce_mutation is None:
+            return
+        payloads = self.state_manager.pick_ce_seeds(batch_size)
+        if not payloads:
+            return
+
+        anchors: FuzzingSeed = self.state_manager.seeds_to_batch(payloads)
+        anchor_tensor = anchors.tensor.to(self.device)
+        restricted_anchor_patterns = torch.stack([p["pattern"] for p in payloads], dim=0).to(self.device)
+
+        with torch.no_grad():
+            # Anchor pattern must be full-width for HPGDPullbackMutation's
+            # internal margin loss; stable positions are pinned to the
+            # anchor input's own natural sign there (they can never move
+            # regardless, so this is a no-op "don't care" fill-in, not an
+            # assumption about their true value elsewhere in the box).
+            full_pattern = _relu_sign_pattern_batched(self.model, anchor_tensor)
+        full_pattern[:, self.state_manager.candidate_indices] = restricted_anchor_patterns
+
+        self.gce_mutation.set_anchors(full_pattern)
+        inputs = self.gce_mutation.mutate(anchor_tensor, self.model)
+
+        with torch.no_grad():
+            output = self.model(inputs)
+        outputs = output["output"] if isinstance(output, dict) else output
+        violation_mask, counterexamples = self.property_checker.check(inputs=inputs, outputs=outputs, seeds=anchors)
+
+        with torch.no_grad():
+            achieved_pattern = _relu_sign_pattern_batched(self.model, inputs)
+        admitted = self._observe_state(anchors, inputs, full_pattern, achieved_pattern, violation_mask)
+        energies = torch.clamp(admitted.float() * 10.0 + violation_mask.float() * 100.0, min=0.1)
+
+        for ce in counterexamples:
+            self.counterexamples.append(ce)
+            if self.config.verbose >= 2:
+                print(f"🚨 [GCE] Counterexample #{len(self.counterexamples)}: {ce.summary()}")
+            if self.config.save_counterexamples:
+                self.config.output_dir.mkdir(parents=True, exist_ok=True)
+                ce.save(self.config.output_dir / f"ce_{len(self.counterexamples)}.pt")
+
+        child_seeds = FuzzingSeed(
+            tensor=inputs,
+            original_tensor=anchors.original_tensor,
+            original_index=anchors.original_index,
+            label=anchors.label,
+            energy=energies,
+            depth=anchors.depth + 1,
+            parent_id=anchors.id,
+        )
+        self.seed_corpus.add(child_seeds, admitted | violation_mask)
 
     def _compute_energy(self, coverage_delta: float, found_violation: bool) -> float:
         """Compute seed energy (higher = more interesting)."""
