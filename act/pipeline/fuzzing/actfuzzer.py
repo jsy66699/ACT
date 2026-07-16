@@ -398,7 +398,9 @@ class ACTFuzzer:
             seeds=seeds,
         )
 
-        # 5. coverage update — returns per-sample interestingness mask
+        # 5. coverage update — returns per-sample interestingness mask.
+        # Always computed/accumulated regardless of strategy (see step 6),
+        # even though HPGD doesn't use it to gate corpus admission.
         activations = self.mutation_engine.get_activation_map()
         global_delta, cov_interesting = self.coverage_tracker.update(
             inputs, activations
@@ -408,8 +410,20 @@ class ACTFuzzer:
         self.coverage_tracker.update(inputs, activations, strategy=_other)
 
         # 6. energy computation (fully vectorized)
-        interesting_mask = violation_mask | cov_interesting
-        energies = cov_interesting.float() * 10.0 + violation_mask.float() * 100.0
+        # HPGD is pattern-driven, not coverage-driven: a mutated sample is
+        # "interesting" iff it reached a ReLU sign pattern this run hasn't
+        # produced before (HPGDMutation.last_new_state_mask), not iff
+        # CoverageTracker judged it interesting. Every other strategy keeps
+        # the original coverage-gated behavior unchanged.
+        if self.mutation_engine.last_strategy == "hpgd":
+            new_state_mask = self.mutation_engine.strategies["hpgd"].last_new_state_mask
+            if new_state_mask is None:
+                new_state_mask = torch.zeros(batch_size, dtype=torch.bool, device=inputs.device)
+            interesting_mask = violation_mask | new_state_mask
+            energies = new_state_mask.float() * 10.0 + violation_mask.float() * 100.0
+        else:
+            interesting_mask = violation_mask | cov_interesting
+            energies = cov_interesting.float() * 10.0 + violation_mask.float() * 100.0
         energies = torch.clamp(energies, min=0.1)
 
         # 7. counterexamples — already sparse list from checker

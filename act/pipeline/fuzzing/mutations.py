@@ -277,6 +277,151 @@ class PGDMutation(MutationStrategy):
         return x_adv.detach()
 
 
+def _relu_preactivations_batched(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Concatenated ReLU pre-activation values [B, N] across every ReLU
+    layer in module-registration order. Keeps the autograd graph (used for
+    the hinge-loss gradient in HPGDMutation)."""
+    preacts: List[torch.Tensor] = []
+    handles = []
+
+    def hook(_module, inputs):
+        if inputs and torch.is_tensor(inputs[0]):
+            preacts.append(inputs[0])
+
+    for module in model.modules():
+        if isinstance(module, nn.ReLU):
+            handles.append(module.register_forward_pre_hook(hook))
+    try:
+        model(x)
+    finally:
+        for handle in handles:
+            handle.remove()
+    if not preacts:
+        raise RuntimeError("Model has no ReLU layers reachable from a forward pass on this input.")
+    return torch.cat([z.flatten(start_dim=1) for z in preacts], dim=1)
+
+
+def _relu_sign_pattern_batched(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Concrete ReLU pre-activation sign pattern (+-1) [B, N], no grad."""
+    with torch.no_grad():
+        z = _relu_preactivations_batched(model, x)
+    return torch.where(z > 0, torch.ones_like(z), -torch.ones_like(z))
+
+
+class HPGDMutation(MutationStrategy):
+    """
+    HPGD (hinge-loss pattern PGD): moves the seed toward a randomly flipped
+    ReLU sign-pattern target via hinge-loss sign-gradient descent, instead
+    of an attack loss. See act.pipeline.fuzzing.pattern_search_pgd for the
+    standalone two-phase exploration this is adapted from -- this is the
+    "phase 1 projection" step made into a reusable MutationStrategy.
+
+    Each call flips `flip_count` neurons of the seed's OWN current sign
+    pattern (computed fresh from `input_tensor`, per sample) to build a
+    per-sample target pattern, then runs `num_steps` of margin-loss
+    ("hinge loss") sign-gradient descent toward it, clamped every step to a
+    local box of radius `perturb_size` around the seed (mirroring
+    PGDMutation's own box). This is the "randomly generate the target
+    state" first-pass version; MutationEngine's post-mutate InputSpec
+    projection still applies afterward like every other strategy.
+
+    After mutate() returns, `last_new_state_mask` records, per sample,
+    whether the ACHIEVED pattern is one this instance has not produced
+    before -- an exact-match dedup via a hash set of pattern bytes, not a
+    Hamming-distance diversity check. This will later be replaced by a
+    BK-tree-based state manager; for now, ACTFuzzer reads this mask to
+    decide corpus admission and energy for the "hpgd" strategy specifically,
+    deliberately NOT consulting CoverageTracker's own interestingness
+    signal here (coverage keeps being computed as normal for every
+    strategy; HPGD just doesn't use it to gate seed admission).
+    """
+
+    def __init__(
+        self,
+        perturb_size: Union[float, torch.Tensor] = 8 / 255,
+        flip_count: int = 10,
+        num_steps: int = 10,
+        step_size: Optional[float] = None,
+        margin: float = 0.01,
+    ):
+        """
+        Initialize HPGD mutation.
+
+        Args:
+            perturb_size: L_infinity radius of the local feasible box around the seed (scalar or per-dimension tensor)
+            flip_count: Number of ReLU neurons to flip away from the seed's own natural pattern, per sample
+            num_steps: Number of hinge-loss sign-gradient steps
+            step_size: Per-step size (if None, computed from the feasible box range / steps)
+            margin: Hinge-loss margin -- a neuron counts as "matching" the target once its
+                signed pre-activation clears this margin
+        """
+        self.perturb_size = perturb_size
+        self.flip_count = int(flip_count)
+        self.num_steps = int(num_steps)
+        self.step_size = step_size
+        self.margin = float(margin)
+        self._seen_states: set = set()
+        self.last_new_state_mask: Optional[torch.Tensor] = None
+
+    def mutate(self, input_tensor, model, activations=None, label=None):
+        """Apply HPGD mutation.
+
+        Args:
+            input_tensor: Seed input tensor [B, ...]
+            model: Model for gradient computation
+            activations: Activations from previous inference (unused by HPGD)
+            label: Ground truth label (unused by HPGD -- pattern-driven, not label-driven)
+
+        Returns:
+            Mutated input tensor [B, ...], moved toward each sample's randomly-flipped
+            target ReLU sign pattern.
+        """
+        x0 = input_tensor.detach()
+        B = x0.shape[0]
+        device = x0.device
+
+        natural_pattern = _relu_sign_pattern_batched(model, x0)
+        num_neurons = natural_pattern.shape[1]
+
+        target_pattern = natural_pattern.clone()
+        k = min(self.flip_count, num_neurons)
+        if k > 0:
+            for b in range(B):
+                flip_idx = torch.randperm(num_neurons, device=device)[:k]
+                target_pattern[b, flip_idx] *= -1
+
+        perturb_size = self.perturb_size.to(device) if isinstance(self.perturb_size, torch.Tensor) else self.perturb_size
+        x_low = x0 - perturb_size
+        x_high = x0 + perturb_size
+
+        if self.step_size is None:
+            step_size = float((x_high - x_low).abs().max().item()) / max(self.num_steps, 1)
+            step_size = max(step_size, 1e-6)
+        else:
+            step_size = float(self.step_size)
+
+        x = x0.clone()
+        for _ in range(self.num_steps):
+            x_req = x.detach().clone().requires_grad_(True)
+            z_all = _relu_preactivations_batched(model, x_req)
+            # Hinge loss: penalize any neuron whose signed pre-activation hasn't
+            # cleared `margin` in the target's direction yet.
+            violation = (self.margin - target_pattern * z_all).clamp(min=0)
+            loss = violation.sum()
+            grad = torch.autograd.grad(loss, x_req, retain_graph=False, create_graph=False)[0].detach()
+            x = (x_req.detach() - step_size * torch.sign(grad)).detach()
+            x = torch.max(torch.min(x, x_high), x_low).detach()
+
+        achieved_pattern = _relu_sign_pattern_batched(model, x)
+        new_mask = torch.zeros(B, dtype=torch.bool, device=device)
+        for b in range(B):
+            key = achieved_pattern[b].to(torch.int8).cpu().numpy().tobytes()
+            if key not in self._seen_states:
+                self._seen_states.add(key)
+                new_mask[b] = True
+        self.last_new_state_mask = new_mask
+
+        return x.detach()
 
 
 class ActivationMutation(MutationStrategy):
@@ -424,6 +569,7 @@ class MutationEngine:
         self.strategies = {
             "gradient": FGSMMutation(perturb_size=perturb_size),
             "pgd": PGDMutation(perturb_size=perturb_size),
+            "hpgd": HPGDMutation(perturb_size=perturb_size),
             "activation": ActivationMutation(perturb_size=perturb_size),
             "boundary": BoundaryMutation(perturb_size=perturb_size),
             "random": RandomMutation(perturb_size=perturb_size),
