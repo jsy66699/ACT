@@ -549,6 +549,28 @@ class ACTFuzzer:
         fold into) interesting_mask."""
         assert self.state_manager is not None
         B = child_inputs.shape[0]
+
+        # Exact-match admission is the default (diversity_threshold 1), and it
+        # is the case a fingerprint can answer in bulk. Anything larger is a
+        # Hamming-ball query, which fingerprints cannot express, so it stays on
+        # the per-sample BK-tree path below.
+        if max(0, self.state_manager.diversity_threshold - 1) == 0:
+            admitted = self.state_manager.observe_batch(
+                seed_tensors=child_inputs,
+                patterns_full=achieved_pattern,
+                labels=parent_seeds.label,
+                original_tensors=parent_seeds.original_tensor,
+                original_indices=parent_seeds.original_index,
+                is_ce_mask=violation_mask,
+            )
+            if admitted.any():
+                restricted_natural = self.state_manager.restrict(natural_pattern)
+                restricted_achieved = self.state_manager.restrict(achieved_pattern)
+                for b in admitted.nonzero(as_tuple=True)[0].tolist():
+                    flipped = (restricted_natural[b] != restricted_achieved[b]).nonzero(as_tuple=True)[0]
+                    self.state_manager.update_local_bias(child_inputs[b : b + 1], flipped)
+            return admitted
+
         admitted = torch.zeros(B, dtype=torch.bool, device=child_inputs.device)
         # One transfer instead of B per-element .item() syncs in the loop.
         is_ce_list = violation_mask.tolist()

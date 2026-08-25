@@ -290,11 +290,96 @@ class PatternStateManager:
         self._local_bias: Dict[bytes, torch.Tensor] = {}
         self._ce_seeds: List[Dict[str, torch.Tensor]] = []
 
+        # Fingerprint fast path, used by observe_batch when the diversity
+        # threshold reduces to exact-match. A restricted pattern is a bit
+        # vector, so packing it into a few int64 words is lossless: two
+        # patterns share a fingerprint iff they agree on every candidate
+        # neuron. That turns "compare 128 dims against every stored pattern"
+        # into "compare 4 integers", making lookup cost independent of how
+        # many patterns are stored -- which is the whole problem, since the
+        # registry grows past 100k within a 60s run.
+        # 32 bits per word (not 64) keeps every partial product well inside
+        # signed int64, so the packing matmul cannot overflow.
+        self._BITS_PER_WORD = 32
+        self._pack_words = (self.num_candidates + self._BITS_PER_WORD - 1) // self._BITS_PER_WORD
+        self._pow2 = (2 ** torch.arange(self._BITS_PER_WORD, dtype=torch.int64, device=device))
+        self._seen: set = set()
+
     # -- helpers ------------------------------------------------------------
 
     def restrict(self, pattern_full: torch.Tensor) -> torch.Tensor:
         """Restrict a full [..., N] pattern to the unstable candidate dims."""
         return pattern_full.index_select(-1, self.candidate_indices)
+
+    def fingerprint(self, restricted: torch.Tensor) -> torch.Tensor:
+        """Pack [B, C] of +-1 into [B, W] int64, losslessly, in one matmul."""
+        B, C = restricted.shape
+        bits = (restricted > 0).to(torch.int64)
+        pad = self._pack_words * self._BITS_PER_WORD - C
+        if pad:
+            bits = torch.cat([bits, bits.new_zeros(B, pad)], dim=1)
+        return (bits.view(B, self._pack_words, self._BITS_PER_WORD) * self._pow2).sum(dim=2)
+
+    def observe_batch(
+        self,
+        seed_tensors: torch.Tensor,
+        patterns_full: torch.Tensor,
+        labels: Optional[torch.Tensor],
+        original_tensors: torch.Tensor,
+        original_indices: torch.Tensor,
+        is_ce_mask: torch.Tensor,
+        per_instance: bool = True,
+    ) -> torch.Tensor:
+        """Exact-match admission for a whole batch. Returns BoolTensor[B].
+
+        Only valid when diversity_threshold reduces to exact match -- a
+        fingerprint proves equality but says nothing about Hamming distance,
+        so any larger threshold must keep using observe()/the BK-tree.
+
+        With per_instance=True the instance index joins the fingerprint, so
+        each verification problem keeps its own state space in one shared
+        table. That matters because a batch lane is a DIFFERENT instance with
+        its own input box and property: lane 300 reproducing a pattern lane 5
+        already logged is novel FOR LANE 300, and the global table rejected it.
+        """
+        B = seed_tensors.shape[0]
+        restricted = self.restrict(patterns_full.reshape(B, -1))
+        keys = self.fingerprint(restricted)
+        if per_instance:
+            keys = torch.cat([original_indices.reshape(B, 1).to(keys.device), keys], dim=1)
+
+        # One transfer for the batch, instead of per-sample slicing and .item().
+        keys_cpu = keys.cpu().numpy()
+        is_ce_list = is_ce_mask.tolist()
+        admitted = torch.zeros(B, dtype=torch.bool, device=seed_tensors.device)
+        admitted_list = []
+        for b in range(B):
+            key = keys_cpu[b].tobytes()
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            admitted[b] = True
+            admitted_list.append(b)
+
+        # Payloads are only materialized for admitted lanes, and only when
+        # something can actually consume them (pick_seeds / pick_ce_seeds).
+        for b in admitted_list:
+            is_ce = bool(is_ce_list[b])
+            payload = {
+                "seed": seed_tensors[b : b + 1].detach().clone(),
+                "label": (labels[b : b + 1].detach().clone() if labels is not None
+                          else torch.full((1,), -1, dtype=torch.long)),
+                "original_tensor": original_tensors[b : b + 1].detach().clone(),
+                "original_index": original_indices[b : b + 1].detach().clone(),
+                "is_ce": is_ce,
+                "energy_bonus": 5.0 if is_ce else 1.0,
+            }
+            node = _BKNode(point=restricted[b].detach().clone(), payload=payload)
+            self._registry.append(node)
+            self.tree.size += 1
+            if is_ce:
+                self._ce_seeds.append({**payload, "pattern": restricted[b].detach().clone()})
+        return admitted
 
     @staticmethod
     def hash_seed(seed_tensor: torch.Tensor) -> bytes:
