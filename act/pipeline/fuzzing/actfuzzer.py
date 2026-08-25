@@ -152,6 +152,10 @@ class FuzzingConfig:
     # Normalize each neuron's hinge term by its activation scale, so neurons
     # with large pre-activations don't dominate the summed loss.
     hpgd_normalize_by_scale: bool = False
+    # Weight HPGD's flip choice by per-neuron marginal occupancy, so it aims at
+    # under-explored regions instead of drawing k positions uniformly. Combined
+    # multiplicatively with local_bias; see PatternStateManager.sparsity_weights.
+    hpgd_sparse_targets: bool = True
     # HPGD-Cov (the "hpgd_cov" strategy) tuning: coverage-targeted, each sample
     # chases its own randomly-drawn never-activated neurons.
     hpgd_cov_target_count: int = 3
@@ -410,6 +414,20 @@ class ACTFuzzer:
             _hpgd_cov.step_decay = bool(self.config.hpgd_cov_step_decay)
             _hpgd_cov.nearest_margin = bool(self.config.hpgd_cov_nearest_margin)
 
+        # Only wired when "hpgd" can actually be drawn -- local_bias_batch
+        # hashes every seed in the batch, which is wasted work at weight 0.
+        self._hpgd_strategy = (
+            self.mutation_engine.strategies.get("hpgd")
+            if float(self.config.mutation_weights.get("hpgd", 0.0)) > 0 else None
+        )
+
+        self._hpgd_diag = (
+            {"calls": 0, "lanes": 0, "target_seen": 0, "achieved_seen": 0,
+             "target_reached": 0, "pattern_moved": 0,
+             "asked": 0, "landed": 0, "collateral": 0}
+            if self._hpgd_strategy is not None else None
+        )
+
         self.property_checker = PropertyChecker(self.output_spec)
         self.seed_corpus = SeedCorpus(
             initial_seeds=initial_seeds, strategy=self.config.seed_selection_strategy
@@ -523,6 +541,8 @@ class ACTFuzzer:
             hpgd.flip_count = self.config.hpgd_flip_count
             hpgd.num_steps = self.config.hpgd_num_steps
             hpgd.margin = self.config.hpgd_margin
+            hpgd.loss_scope = self.config.hpgd_loss_scope
+            hpgd.hold_still_weight = self.config.hpgd_hold_still_weight
 
         if self.config.enable_bi_gce:
             self.gce_mutation = HPGDPullbackMutation(
@@ -699,8 +719,64 @@ class ACTFuzzer:
             with torch.no_grad():
                 natural_pattern = _relu_sign_pattern_batched(self.model, seeds.tensor.to(self.device))
 
+        # Close HPGD's feedback loop. update_local_bias() has always recorded,
+        # for every admitted sample, which unstable-subspace positions actually
+        # flipped to produce it -- but nothing ever read that back, so
+        # HPGDMutation.flip_weights stayed None and it picked its K target
+        # neurons with a uniform torch.randperm every call. The manager was
+        # maintaining a table on every iteration that no one consulted, and the
+        # strategy was random-walking while admission scored novelty; the two
+        # never talked. Feeding the recorded bias in is what makes HPGD's
+        # target selection exploit what proved flippable from THIS seed.
+        if self._hpgd_strategy is not None and self.state_manager is not None:
+            w = self.state_manager.local_bias_batch(seeds.tensor.to(self.device))
+            if self.config.hpgd_sparse_targets and natural_pattern is not None:
+                # Multiply the two signals rather than pick one: local_bias says
+                # which neurons proved FLIPPABLE from this seed, sparsity says
+                # which flips LEAD SOMEWHERE under-explored. Either alone is
+                # half the question -- a flippable neuron that returns to a
+                # crowded region wastes the projection, and a neuron pointing
+                # somewhere novel that will not move wastes it too. An unseen
+                # seed has uniform local_bias, so sparsity then decides alone.
+                w = w * self.state_manager.sparsity_weights(
+                    self.state_manager.restrict(natural_pattern)
+                )
+            self._hpgd_strategy.flip_weights = w
+
         # 2. mutate — takes FuzzingSeed, returns Tensor[B, ...]
         inputs = self.mutation_engine.mutate(seeds)
+
+        # Diagnostic: is HPGD spending its 10 gradient steps aiming at states it
+        # has already visited? PatternSearchPGD re-flips until the TARGET is
+        # unseen (pattern_search_pgd.py:392); HPGDMutation only ever filters the
+        # ACHIEVED pattern, at admission, after the cost is sunk. Measure the
+        # gap before deciding whether porting that retry is worth it.
+        if (self._hpgd_diag is not None
+                and self.mutation_engine.last_strategy == "hpgd"
+                and self.state_manager is not None):
+            hp = self._hpgd_strategy
+            if hp is not None and hp.last_target_pattern is not None:
+                rows = seeds.original_index.to(self.device)
+                tgt_seen = self.state_manager.seen_mask(hp.last_target_pattern, rows)
+                ach_seen = self.state_manager.seen_mask(hp.last_achieved_pattern, rows)
+                reached = (hp.last_target_pattern == hp.last_achieved_pattern).all(dim=1).cpu()
+                moved = (hp.last_natural_pattern != hp.last_achieved_pattern).any(dim=1).cpu()
+                # The question full-pattern equality is too strict to answer:
+                # of the neurons this call ASKED to flip, how many actually
+                # flipped? Everything else is collateral.
+                asked = (hp.last_target_pattern != hp.last_natural_pattern)
+                landed = asked & (hp.last_achieved_pattern == hp.last_target_pattern)
+                collateral = (~asked) & (hp.last_achieved_pattern != hp.last_natural_pattern)
+                d = self._hpgd_diag
+                d["lanes"] += tgt_seen.numel()
+                d["target_seen"] += int(tgt_seen.sum())
+                d["achieved_seen"] += int(ach_seen.sum())
+                d["target_reached"] += int(reached.sum())
+                d["pattern_moved"] += int(moved.sum())
+                d["asked"] += int(asked.sum())
+                d["landed"] += int(landed.sum())
+                d["collateral"] += int(collateral.sum())
+                d["calls"] += 1
 
         # 3. inference
         with torch.no_grad():
@@ -941,6 +1017,19 @@ class ACTFuzzer:
             if fc["ran"] == 0:
                 print("   ⚠️  HPGD-Cov never steered: it ran as Gaussian noise "
                       "for the whole run (coverage saturated?).")
+
+        d = self._hpgd_diag
+        if d is not None and d["lanes"] > 0:
+            L = d["lanes"]
+            print(f"   HPGD targets: {d['calls']} calls / {L} lanes | "
+                  f"target already seen {d['target_seen'] / L:.1%} | "
+                  f"achieved already seen {d['achieved_seen'] / L:.1%} | "
+                  f"target reached {d['target_reached'] / L:.1%} | "
+                  f"pattern moved at all {d['pattern_moved'] / L:.1%}")
+            a = max(d["asked"], 1)
+            print(f"   HPGD flips: asked {d['asked'] / L:.2f}/lane | "
+                  f"landed {d['landed'] / a:.1%} of asked | "
+                  f"collateral {d['collateral'] / L:.2f}/lane")
         print(f"{rule()}\n")
 
         if self.config.save_counterexamples and report.counterexamples:

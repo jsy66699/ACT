@@ -305,6 +305,16 @@ class PatternStateManager:
         self._pow2 = (2 ** torch.arange(self._BITS_PER_WORD, dtype=torch.int64, device=device))
         self._seen: set = set()
 
+        # Per-neuron marginal occupancy over admitted patterns, for steering
+        # flips toward under-explored regions. The exact question -- "which
+        # target is farthest from everything seen" -- is O(B*M*C) per iteration
+        # against a registry that passes 100k, so this tracks the marginal
+        # instead: how often each candidate neuron has been +1. That ignores
+        # correlations between neurons, but costs one sum per batch and one
+        # compare per lane rather than a nearest-neighbour scan.
+        self._sign_count = torch.zeros(self.num_candidates, dtype=torch.float64, device=device)
+        self._sign_total = 0
+
     # -- helpers ------------------------------------------------------------
 
     def restrict(self, pattern_full: torch.Tensor) -> torch.Tensor:
@@ -319,6 +329,24 @@ class PatternStateManager:
         if pad:
             bits = torch.cat([bits, bits.new_zeros(B, pad)], dim=1)
         return (bits.view(B, self._pack_words, self._BITS_PER_WORD) * self._pow2).sum(dim=2)
+
+    def seen_mask(
+        self,
+        patterns_full: torch.Tensor,
+        original_indices: torch.Tensor,
+        per_instance: bool = True,
+    ) -> torch.Tensor:
+        """[B] bool: which of these patterns are already recorded. Pure query,
+        records nothing -- for asking "would this have been rejected" without
+        perturbing the run, e.g. measuring how often HPGD aims at a state it
+        has already visited."""
+        B = patterns_full.shape[0]
+        keys = self.fingerprint(self.restrict(patterns_full.reshape(B, -1)))
+        if per_instance:
+            keys = torch.cat([original_indices.reshape(B, 1).to(keys.device), keys], dim=1)
+        keys_cpu = keys.cpu().numpy()
+        return torch.tensor([keys_cpu[b].tobytes() in self._seen for b in range(B)],
+                            dtype=torch.bool)
 
     def observe_batch(
         self,
@@ -360,6 +388,13 @@ class PatternStateManager:
             self._seen.add(key)
             admitted[b] = True
             admitted_list.append(b)
+
+        # Marginal occupancy counts only what was actually admitted -- rejected
+        # duplicates would double-count states already represented.
+        if admitted_list:
+            adm = restricted[admitted_list]
+            self._sign_count += (adm > 0).sum(dim=0).to(self._sign_count.dtype)
+            self._sign_total += len(admitted_list)
 
         # Payloads are only materialized for admitted lanes, and only when
         # something can actually consume them (pick_seeds / pick_ce_seeds).
@@ -459,6 +494,48 @@ class PatternStateManager:
 
     def local_bias(self, seed_tensor: torch.Tensor) -> Optional[torch.Tensor]:
         return self._local_bias.get(self.hash_seed(seed_tensor))
+
+    def sparsity_weights(self, natural_restricted: torch.Tensor) -> torch.Tensor:
+        """[B, C] flip scores: high where flipping LEAVES a crowded side.
+
+        For lane b and candidate j, flipping sends neuron j to the sign
+        opposite its current one, so the score is 1 - freq(destination sign):
+        currently +1 scores freq_plus (its -1 destination is rare exactly when
+        +1 is common), currently -1 scores 1 - freq_plus. A neuron already
+        sitting in the rare state therefore scores low -- flipping it back into
+        the crowd is the opposite of what this is for.
+
+        Uniform until something has been admitted, so an empty history steers
+        nothing rather than steering arbitrarily.
+        """
+        if self._sign_total == 0:
+            return torch.ones_like(natural_restricted, dtype=torch.float32)
+        freq_plus = (self._sign_count / self._sign_total).to(
+            natural_restricted.device, torch.float32
+        )
+        return torch.where(natural_restricted > 0, freq_plus, 1.0 - freq_plus).clamp(min=1e-3)
+
+    def local_bias_batch(self, seed_tensors: torch.Tensor) -> torch.Tensor:
+        """[B, num_candidates] flip weights for a whole batch of seeds.
+
+        Seeds with no recorded bias (never admitted, or admitted before this
+        manager saw them) fall back to a uniform row, which reproduces HPGD's
+        unbiased torch.randperm choice for that lane -- so an unknown seed
+        behaves exactly as it did before this was wired up, rather than being
+        silently steered by someone else's history.
+
+        One host transfer for the batch, then per-lane dict lookups, mirroring
+        observe_batch: hash_seed keys on raw float32 bytes, so the lookup has
+        to happen lane by lane regardless.
+        """
+        B = seed_tensors.shape[0]
+        flat = seed_tensors.detach().to(torch.float32).cpu().numpy().reshape(B, -1)
+        rows = []
+        for b in range(B):
+            w = self._local_bias.get(flat[b].tobytes())
+            rows.append(w if w is not None
+                        else torch.full((self.num_candidates,), 1.0, device=self.device))
+        return torch.stack(rows, dim=0)
 
     # -- scheduling -----------------------------------------------------------
 

@@ -605,6 +605,8 @@ class HPGDMutation(MutationStrategy):
         step_size: Optional[float] = None,
         margin: float = 0.01,
         candidate_indices: Optional[torch.Tensor] = None,
+        loss_scope: str = "target_only",
+        hold_still_weight: float = 1.0,
     ):
         """
         Initialize HPGD mutation.
@@ -625,9 +627,21 @@ class HPGDMutation(MutationStrategy):
         self.step_size = step_size
         self.margin = float(margin)
         self.candidate_indices = candidate_indices
+        # Which neurons the hinge loss scores. "all" sums over every neuron, so
+        # the k targets compete against the N-k the target pattern asks to hold
+        # still; under sign(grad) every dimension moves a full step regardless
+        # of how strongly it wanted to, so a majority of hold-still terms can
+        # cancel the flips outright. Measured on safenlp: of 10 requested
+        # flips, 1.5 landed while 10-14 unrequested neurons flipped anyway.
+        # "target_only" scores just the requested flips.
+        self.loss_scope = str(loss_scope)
+        # Relative weight of the hold-still terms under scope "all"; 0.0 makes
+        # it equivalent to "target_only".
+        self.hold_still_weight = float(hold_still_weight)
         self.flip_weights: Optional[torch.Tensor] = None
         self.last_natural_pattern: Optional[torch.Tensor] = None
         self.last_achieved_pattern: Optional[torch.Tensor] = None
+        self.last_target_pattern: Optional[torch.Tensor] = None
 
     def mutate(self, input_tensor, model, activations=None, rows=None):
         """Apply HPGD mutation.
@@ -680,6 +694,15 @@ class HPGDMutation(MutationStrategy):
         else:
             step_size = float(self.step_size)
 
+        # Per-neuron loss weights, fixed for the whole projection: 1 on the
+        # neurons this call asked to flip, hold_still_weight (0 under
+        # "target_only") on the rest.
+        asked = (target_pattern != natural_pattern)
+        if self.loss_scope == "target_only":
+            term_weight = asked.to(x0.dtype)
+        else:
+            term_weight = asked.to(x0.dtype) + (~asked).to(x0.dtype) * self.hold_still_weight
+
         x = x0.clone()
         for _ in range(self.num_steps):
             x_req = x.detach().clone().requires_grad_(True)
@@ -687,7 +710,7 @@ class HPGDMutation(MutationStrategy):
             # Hinge loss: penalize any neuron whose signed pre-activation hasn't
             # cleared `margin` in the target's direction yet.
             violation = (self.margin - target_pattern * z_all).clamp(min=0)
-            loss = violation.sum()
+            loss = (violation * term_weight).sum()
             grad = torch.autograd.grad(loss, x_req, retain_graph=False, create_graph=False)[0].detach()
             x = (x_req.detach() - step_size * torch.sign(grad)).detach()
             x = torch.max(torch.min(x, x_high), x_low).detach()
@@ -695,6 +718,10 @@ class HPGDMutation(MutationStrategy):
         achieved_pattern = _relu_sign_pattern_batched(model, x)
         self.last_natural_pattern = natural_pattern
         self.last_achieved_pattern = achieved_pattern
+        # Kept so a caller can ask what this call was AIMING at, not just where
+        # it landed -- the two differ whenever the box or the step budget stops
+        # the projection short.
+        self.last_target_pattern = target_pattern
 
         return x.detach()
 
