@@ -192,10 +192,26 @@ class _StateBKTree:
     def __init__(self) -> None:
         self._root: Optional[_BKNode] = None
         self.size = 0
+        # Exact-match index, maintained alongside the tree. At threshold 0 --
+        # which is what diversity_threshold=1, the default, reduces to -- the
+        # tree walk below is answering "has this exact pattern been seen", and
+        # a walk is the wrong structure for that: every miss visits the whole
+        # tree, each visit paying a _hamming() .item() sync, and admission runs
+        # ~97% on a real benchmark so misses are the common case. Profiling a
+        # 20s safenlp run: has_within 3.04s of 20s total. This dict answers the
+        # same question in O(1) and is only consulted when threshold == 0, so
+        # the tree stays authoritative for every diversity_threshold > 1.
+        self._exact: set = set()
+
+    @staticmethod
+    def _key(point: torch.Tensor) -> bytes:
+        return point.detach().to(torch.int8).cpu().numpy().tobytes()
 
     def has_within(self, point: torch.Tensor, threshold: int) -> bool:
         if self._root is None:
             return False
+        if threshold == 0:
+            return self._key(point) in self._exact
         stack = [self._root]
         while stack:
             node = stack.pop()
@@ -208,6 +224,7 @@ class _StateBKTree:
         return False
 
     def insert(self, point: torch.Tensor, payload: Dict[str, Any]) -> _BKNode:
+        self._exact.add(self._key(point))
         if self._root is None:
             self._root = _BKNode(point=point, payload=payload)
             self.size += 1
@@ -305,17 +322,18 @@ class PatternStateManager:
         CE-anchor pool if `is_ce`)."""
         pattern = self.restrict(pattern_full.reshape(-1))
 
-        if not self.bloom.might_contain(pattern):
-            self.bloom.add(pattern)
-        # A bloom hit can be a false positive, so the BK-tree check below
-        # still runs regardless -- the bloom filter only saves the (rarer)
-        # true-miss case from paying for a tree traversal at all... it
-        # doesn't currently short-circuit anything by itself yet since the
-        # tree check is cheap relative to the hash; kept as a structural
-        # hook for a future GPU-resident hash where the bloom check really
-        # is far cheaper than a tree walk.
-
         reject_threshold = max(0, self.diversity_threshold - 1)
+
+        # The bloom filter is a pre-check for the tree walk, so it only earns
+        # its keep when there IS a walk. At reject_threshold 0 the tree query
+        # is already an O(1) exact-match lookup (see _StateBKTree._exact), so
+        # hashing the pattern here would cost strictly more than the check it
+        # is meant to save -- profiling a 20s safenlp run put might_contain at
+        # 1.58s of 20s while short-circuiting nothing, because a bloom hit can
+        # be a false positive and the tree check has to run regardless.
+        if reject_threshold > 0 and not self.bloom.might_contain(pattern):
+            self.bloom.add(pattern)
+
         if self.tree.has_within(pattern, reject_threshold):
             return False
 

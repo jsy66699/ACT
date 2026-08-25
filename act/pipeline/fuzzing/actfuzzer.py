@@ -550,8 +550,10 @@ class ACTFuzzer:
         assert self.state_manager is not None
         B = child_inputs.shape[0]
         admitted = torch.zeros(B, dtype=torch.bool, device=child_inputs.device)
+        # One transfer instead of B per-element .item() syncs in the loop.
+        is_ce_list = violation_mask.tolist()
         for b in range(B):
-            is_ce = bool(violation_mask[b].item())
+            is_ce = bool(is_ce_list[b])
             ok = self.state_manager.observe(
                 seed_tensor=child_inputs[b : b + 1],
                 pattern_full=achieved_pattern[b : b + 1],
