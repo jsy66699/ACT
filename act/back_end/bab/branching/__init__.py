@@ -15,11 +15,11 @@ from act.back_end.bab.branching.bounding import (
     BoundingStrategy,
     RandomBounding,
     TopKBounding,
+    MCTSBounding,
     OrderFunction,
     DepthLowerBoundOrder,
     GreedyOrder,
     SAOrder,
-    ORDER_REGISTRY,
 )
 
 __all__ = [
@@ -29,9 +29,9 @@ __all__ = [
     "BoundingStrategy",
     "RandomBounding",
     "TopKBounding",
+    "MCTSBounding",
     "OrderFunction",
     "DepthLowerBoundOrder",
     "GreedyOrder",
     "SAOrder",
-    "ORDER_REGISTRY",
 ]

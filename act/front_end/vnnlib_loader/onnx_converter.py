@@ -64,7 +64,9 @@ def _register_qdq_converters() -> None:
     class OnnxQuantizeLinear(nn.Module, OnnxToTorchModule):
         def __init__(self, scale, zero_point, axis=None):
             super().__init__()
-            self.register_buffer("scale", scale.detach().clone().to(dtype=torch.float32))
+            # Registered at the file's own dtype so the model-wide .to(dtype=...)
+            # reaches it; zero_point stays integral, which .to() leaves alone.
+            self.register_buffer("scale", scale.detach().clone())
             self.register_buffer("zero_point", zero_point.detach().clone())
             self.axis = axis
             self.qmin, self.qmax, self.dtype_name = _qrange_from_zero_point(cast(torch.Tensor, self.zero_point))
@@ -77,13 +79,16 @@ def _register_qdq_converters() -> None:
     class OnnxDequantizeLinear(nn.Module, OnnxToTorchModule):
         def __init__(self, scale, zero_point, axis=None):
             super().__init__()
-            self.register_buffer("scale", scale.detach().clone().to(dtype=torch.float32))
+            self.register_buffer("scale", scale.detach().clone())
             self.register_buffer("zero_point", zero_point.detach().clone())
             self.axis = axis
             self.qmin, self.qmax, self.dtype_name = _qrange_from_zero_point(cast(torch.Tensor, self.zero_point))
 
         def forward(self, q, scale=None, zero_point=None):
-            dtype = torch.float32 if not q.is_floating_point() else q.dtype
+            # ONNX DequantizeLinear yields the scale's type; for an integral q
+            # that is the only thing naming the working float precision.
+            scale_buffer = cast(torch.Tensor, self.scale)
+            dtype = scale_buffer.dtype if not q.is_floating_point() else q.dtype
             qf = q.to(dtype=dtype)
             s = _reshape_axis_param(cast(torch.Tensor, self.scale).to(device=q.device, dtype=dtype), qf, self.axis)
             zp = _reshape_axis_param(cast(torch.Tensor, self.zero_point).to(device=q.device, dtype=dtype), qf, self.axis)
@@ -154,16 +159,18 @@ def _fold_dequantize_initializers(onnx_model):
             if attr.name == 'axis':
                 axis = int(onnx.helper.get_attribute_value(attr))
                 break
-        qf = q.astype(np.float32)
-        sf = scale.astype(np.float32)
-        zpf = zp.astype(np.float32)
+        qf = q.astype(np.float64)
+        sf = scale.astype(np.float64)
+        zpf = zp.astype(np.float64)
         if axis is not None and sf.ndim == 1 and sf.size != 1 and qf.ndim > 0:
             ax = axis + qf.ndim if axis < 0 else axis
             shape = [1] * qf.ndim
             shape[ax] = sf.size
             sf = sf.reshape(shape)
             zpf = zpf.reshape(shape)
-        value = (sf * (qf - zpf)).astype(np.float32)
+        # Computed wide, then stored back at the scale's own width: a wider
+        # initializer would not match the types the rest of the graph declares.
+        value = (sf * (qf - zpf)).astype(scale.dtype)
         onnx_model.graph.initializer.append(numpy_helper.from_array(value, name=node.output[0]))
         folded += 1
     if folded:

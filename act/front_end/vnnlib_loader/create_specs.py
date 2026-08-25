@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import Any, List, Tuple, Dict, Optional
 import logging
 import torch.nn as nn
 
@@ -149,10 +149,15 @@ class VNNLibSpecCreator(BaseSpecCreator):
         
         results = []
         
-        # Cache converted models by (category, onnx_filename) so instances
-        # sharing the same ONNX file reuse the same Python object.  This is
-        # critical for model_synthesis.py which groups by id(pytorch_model).
-        _model_cache: Dict[Tuple[str, str], nn.Module] = {}
+        # Cache everything derived from the ONNX file(s) -- converted models and
+        # declared input shape -- by (category, onnx filenames), so instances
+        # sharing a file read and convert it once and reuse the same Python
+        # object.  Object identity is critical for model_synthesis.py which
+        # groups by id(pytorch_model).  Deliberately scoped to this call:
+        # convert_onnx_to_pytorch() moves the model to the active device/dtype in
+        # place, so a process-wide cache could hand back a model mutated for a
+        # different run.
+        _onnx_cache: Dict[Tuple[str, str, Optional[str]], Dict[str, Any]] = {}
         
         for instance_info in all_instances:
             category = instance_info['category']
@@ -170,20 +175,15 @@ class VNNLibSpecCreator(BaseSpecCreator):
             try:
                 # Load instance
                 logger.info(f"Loading instance: {category}/{instance_id}")
+                cache_key = (category, onnx_model, onnx_model_g)
                 instance_data = load_vnnlib_pair(
                     category=category,
                     onnx_model=onnx_model,
                     vnnlib_spec=vnnlib_spec,
                     onnx_model_g=onnx_model_g,
-                    auto_download=False  # Already filtered to downloaded
+                    auto_download=False,  # Already filtered to downloaded
+                    onnx_cache=_onnx_cache.setdefault(cache_key, {})
                 )
-                
-                # Reuse cached model if same ONNX file was already converted
-                cache_key = (category, onnx_model, onnx_model_g)
-                if cache_key in _model_cache:
-                    instance_data['model'] = _model_cache[cache_key]
-                else:
-                    _model_cache[cache_key] = instance_data['model']
                 
                 # Generate specs for this instance
                 result = self._create_specs_for_single_instance(
@@ -195,12 +195,6 @@ class VNNLibSpecCreator(BaseSpecCreator):
                 
                 if result is not None:
                     results.append(result)
-                
-                # Memory optimization: Free instance_data after extracting model/specs
-                # (model itself is kept alive via _model_cache)
-                import gc
-                del instance_data
-                gc.collect()
                 
             except Exception as e:
                 logger.error(

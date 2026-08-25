@@ -4,7 +4,7 @@ Batched seed corpus for GPU-accelerated fuzzing.
 FuzzingSeed — every field carries a leading batch dim B (no scalar path).
 SeedCorpus  — parallel-tensor pool.
   Selection: energy-weighted sampling with replacement → FuzzingSeed(B).
-  Insertion: boolean-mask filtered add() with byte-hash dedup.
+  Insertion: boolean-mask filtered add() with per-spec-row byte-hash dedup.
   Storage:   N parallel 1-D/N-D tensors grown via torch.cat on insert.
 
 Copyright (C) 2025 SVF-tools/ACT
@@ -28,7 +28,7 @@ class FuzzingSeed:
     Attributes:
         tensor:          [B, ...] Input tensors (current, may be mutated)
         original_tensor: [B, ...] Original clean inputs (NEVER mutated)
-        original_index:  [B] int64 — index in the original dataset
+        original_index:  [B] int64 — synthesized spec-row index
         label:           [B] int64 — ground truth label (-1 = no label)
         energy:          [B] float — seed energy (higher = more interesting)
         depth:           [B] int64 — how many mutations from original seed
@@ -97,7 +97,7 @@ class SeedCorpus:
     Features:
     - Energy-based seed selection (higher energy = more likely to select)
     - Random selection as fallback
-    - Automatic seed deduplication (by tensor hash)
+    - Automatic seed deduplication by spec row and tensor hash
     - All storage on device_manager's device (GPU when available)
     
     Example:
@@ -119,7 +119,7 @@ class SeedCorpus:
             strategy: Selection strategy ("energy" or "random")
         """
         self.strategy = strategy
-        self.seen_hashes: set = set()
+        self.seen_hashes: set[tuple[int, int]] = set()
         self._device = get_default_device()
         
         # Build parallel lists from initial seeds, then stack to tensors
@@ -131,13 +131,8 @@ class SeedCorpus:
             t = labeled_tensor.tensor.to(self._device)
             label_val = int(labeled_tensor.label.item()) if isinstance(labeled_tensor.label, torch.Tensor) else labeled_tensor.label
             
-            # Dedup check
-            tensor_hash = self._hash_tensor(t)
-
-            if tensor_hash in self.seen_hashes:
-                continue
-
-            self.seen_hashes.add(tensor_hash)
+            seed_hash = (i, self._hash_tensor(t))
+            self.seen_hashes.add(seed_hash)
             
             tensors.append(t)
             indices.append(i)
@@ -222,9 +217,10 @@ class SeedCorpus:
         # Dedup and collect indices to actually add
         keep = []
         for i in interesting_idx.tolist():
-            tensor_hash = self._hash_tensor(seeds.tensor[i:i+1])
-            if tensor_hash not in self.seen_hashes:
-                self.seen_hashes.add(tensor_hash)
+            original_index = int(seeds.original_index[i].item())
+            seed_hash = (original_index, self._hash_tensor(seeds.tensor[i:i+1]))
+            if seed_hash not in self.seen_hashes:
+                self.seen_hashes.add(seed_hash)
                 keep.append(i)
         
         if not keep:
@@ -239,7 +235,7 @@ class SeedCorpus:
         self._depths = torch.cat([self._depths, seeds.depth[idx]])
         self._ids = torch.cat([self._ids, seeds.id[idx]])
         self._parent_ids = torch.cat([self._parent_ids, seeds.parent_id[idx]])
-        self._select_counts = torch.cat([self._select_counts, torch.zeros(len(keep), dtype=torch.long, device=self._device)])
+        self._select_counts = torch.cat([self._select_counts, seeds.select_count[idx]])
     
     def __len__(self) -> int:
         """Return corpus size."""
@@ -260,7 +256,7 @@ class SeedCorpus:
                 select_count=self._select_counts[i:i+1],
             )
     
-    def get_stats(self) -> dict:
+    def get_stats(self) -> dict[str, object]:
         """Get corpus statistics."""
         n = len(self)
         if n == 0:

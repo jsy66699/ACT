@@ -345,7 +345,7 @@ def _queries_from_rewritten(
     base_in_spec = _build_input_spec(num_inputs, tensor_shape, bounds_dict, [])
 
     if not complex_assert_bodies:
-        out_spec = _build_output_spec([], num_outputs, true_label)
+        out_spec = _build_trivial_output_spec(num_outputs, true_label)
         logger.info(f"Parsed {name}: 1 query(ies) [vnnlib 2.0 input-only]")
         return [(base_in_spec, out_spec)]
 
@@ -357,7 +357,8 @@ def _queries_from_rewritten(
         per_assert.append(qs)
 
     complex_queries = _combine_conjunctive_queries(per_assert)
-    results: List[Tuple[InputSpec, OutputSpec]] = []
+    in_specs: List[InputSpec] = []
+    per_query_y_ineqs: List[_Query] = []
     for q in complex_queries:
         x_ineqs: _Query = []
         y_ineqs: _Query = []
@@ -373,9 +374,14 @@ def _queries_from_rewritten(
                 break
         if skip:
             continue
-        in_spec = _build_input_spec(num_inputs, tensor_shape, bounds_dict, x_ineqs) if x_ineqs else base_in_spec
-        out_spec = _build_output_spec(y_ineqs, num_outputs, true_label)
-        results.append((in_spec, out_spec))
+        in_specs.append(
+            _build_input_spec(num_inputs, tensor_shape, bounds_dict, x_ineqs)
+            if x_ineqs else base_in_spec
+        )
+        per_query_y_ineqs.append(y_ineqs)
+
+    out_specs = _build_output_specs(per_query_y_ineqs, num_outputs, true_label)
+    results: List[Tuple[InputSpec, OutputSpec]] = list(zip(in_specs, out_specs))
 
     if true_label is not None:
         promoted = _try_promote_to_top1(results, num_outputs, true_label)
@@ -913,27 +919,57 @@ def _build_input_spec(
     return InputSpec(kind=InKind.BOX, lb=lb_tensor, ub=ub_tensor)
 
 
-def _build_output_spec(
-    output_ineqs: _Query,
+def _build_trivial_output_spec(num_outputs: int, true_label) -> OutputSpec:
+    """OutputSpec for a query that carries no output inequality: TOP1 against the
+    known label, else an unconstrained RANGE."""
+    if true_label is not None:
+        y_true = _coerce_label_to_tensor(true_label)
+        return OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=y_true)
+    return OutputSpec(
+        kind=OutKind.RANGE,
+        lb=torch.tensor([float('-inf')] * num_outputs),
+        ub=torch.tensor([float('inf')] * num_outputs),
+    )
+
+
+def _build_output_specs(
+    per_query_ineqs: List[_Query],
     num_outputs: int,
     true_label,
-) -> OutputSpec:
-    if not output_ineqs:
-        if true_label is not None:
-            y_true = _coerce_label_to_tensor(true_label)
-            return OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=y_true)
-        return OutputSpec(
-            kind=OutKind.RANGE,
-            lb=torch.tensor([float('-inf')] * num_outputs),
-            ub=torch.tensor([float('inf')] * num_outputs),
+) -> List[OutputSpec]:
+    """Build one OutputSpec per query, materialising EVERY constraint row of the
+    file in a single tensor construction.
+
+    Each query then takes a contiguous row slice of that matrix, so row order,
+    values, dtype and device are exactly those of a per-query construction. The
+    batching matters because the default device is CUDA: one construction per
+    query is one host-to-device transfer per query, and a CIFAR-100 file holds
+    99 single-row queries — the dominant cost of VNNLIB parsing.
+    """
+    rows_c: List[List[float]] = []
+    rows_d: List[float] = []
+    spans: List[Tuple[int, int]] = []
+    for ineqs in per_query_ineqs:
+        start = len(rows_c)
+        for _xc, yc, d in ineqs:
+            rows_c.append(list(yc))
+            rows_d.append(float(d))
+        spans.append((start, len(rows_c)))
+
+    if not rows_c:
+        return [_build_trivial_output_spec(num_outputs, true_label) for _ in spans]
+
+    c_all = torch.tensor(rows_c)
+    d_all = torch.tensor(rows_d)
+    return [
+        _build_trivial_output_spec(num_outputs, true_label) if start == stop
+        else OutputSpec(
+            kind=OutKind.UNSAFE_LINEAR,
+            c=c_all[start:stop],
+            d=d_all[start:stop],
         )
-    rows_c = [list(yc) for _xc, yc, _d in output_ineqs]
-    rows_d = [float(d) for _xc, _yc, d in output_ineqs]
-    return OutputSpec(
-        kind=OutKind.UNSAFE_LINEAR,
-        c=torch.tensor(rows_c),
-        d=torch.tensor(rows_d),
-    )
+        for start, stop in spans
+    ]
 
 
 def _try_promote_to_top1(

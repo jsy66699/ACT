@@ -450,7 +450,8 @@ def load_vnnlib_pair(
     vnnlib_spec: str,
     root_dir: Optional[str] = None,
     auto_download: bool = True,
-    onnx_model_g: Optional[str] = None
+    onnx_model_g: Optional[str] = None,
+    onnx_cache: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Load a VNNLIB benchmark instance (ONNX model + VNNLIB spec).
@@ -465,6 +466,12 @@ def load_vnnlib_pair(
         root_dir: Root directory for VNNLIB data (default: from path_config)
         auto_download: If True, download category if not found locally
         onnx_model_g: Optional second ONNX model for dual-model instances
+        onnx_cache: Read/write memo for everything that depends only on the ONNX
+            file(s): the converted modules ('model', plus 'model_f'/'model_g' for
+            dual-model instances) and the declared 'input_shape'.  Missing entries
+            are filled in, present entries are reused as-is.  Passing the same dict
+            for every instance sharing an ONNX file therefore converts and reads
+            that file exactly once, and keeps object identity across instances.
         
     Returns:
         Dict containing:
@@ -527,32 +534,61 @@ def load_vnnlib_pair(
     
     logger.info(f"Loading VNNLIB instance: {category}/{onnx_model}")
     
-    # Convert ONNX to PyTorch
-    logger.info("[1/3] Converting ONNX model to PyTorch...")
-    try:
-        pytorch_model = convert_onnx_to_pytorch(onnx_path, simplify=True)
-        pytorch_model.eval()
-        logger.info(f"  ✓ Model converted successfully")
-    except ONNXConversionError as e:
-        raise RuntimeError(f"ONNX conversion failed: {e}")
+    if onnx_cache is None:
+        onnx_cache = {}
     
-    pytorch_model_g = None
-    if onnx_path_g is not None:
+    # Convert ONNX to PyTorch.  Conversion (simplify + onnx2torch) dominates the
+    # load time and is identical for a given ONNX file, so a caller processing
+    # many instances of one model skips it for all but the first.
+    if 'model' in onnx_cache:
+        logger.info("[1/3] Reusing already-converted PyTorch model...")
+        model = onnx_cache['model']
+        pytorch_model = onnx_cache.get('model_f', model)
+        pytorch_model_g = onnx_cache.get('model_g')
+        model.eval()
+        logger.info(f"  ✓ Model reused successfully")
+    else:
+        logger.info("[1/3] Converting ONNX model to PyTorch...")
         try:
-            pytorch_model_g = convert_onnx_to_pytorch(onnx_path_g, simplify=True)
-            pytorch_model_g.eval()
-            logger.info(f"  ✓ Second model converted successfully")
+            pytorch_model = convert_onnx_to_pytorch(onnx_path, simplify=True)
+            pytorch_model.eval()
+            logger.info(f"  ✓ Model converted successfully")
         except ONNXConversionError as e:
-            raise RuntimeError(f"Second ONNX conversion failed: {e}")
+            raise RuntimeError(f"ONNX conversion failed: {e}")
+        
+        pytorch_model_g = None
+        if onnx_path_g is not None:
+            try:
+                pytorch_model_g = convert_onnx_to_pytorch(onnx_path_g, simplify=True)
+                pytorch_model_g.eval()
+                logger.info(f"  ✓ Second model converted successfully")
+            except ONNXConversionError as e:
+                raise RuntimeError(f"Second ONNX conversion failed: {e}")
+        
+        model = (
+            pytorch_model if pytorch_model_g is None
+            else _CombinedDualModel(pytorch_model, pytorch_model_g)
+        )
+        onnx_cache['model'] = model
+        if pytorch_model_g is not None:
+            onnx_cache['model_f'] = pytorch_model
+            onnx_cache['model_g'] = pytorch_model_g
     
     # Get input shape from ONNX
     logger.info("[2/3] Extracting input shape...")
-    try:
-        input_shape = get_onnx_input_shape(onnx_path)
-        logger.info(f"  ✓ Input shape: {input_shape}")
-    except ONNXConversionError as e:
-        logger.warning(f"Failed to extract input shape: {e}")
-        input_shape = None
+    if 'input_shape' in onnx_cache:
+        input_shape = onnx_cache['input_shape']
+        logger.info(f"  ✓ Input shape (reused): {input_shape}")
+    else:
+        try:
+            input_shape = get_onnx_input_shape(onnx_path)
+            logger.info(f"  ✓ Input shape: {input_shape}")
+        except ONNXConversionError as e:
+            logger.warning(f"Failed to extract input shape: {e}")
+            input_shape = None
+        # None is cached too, otherwise a file with an unreadable shape would be
+        # re-read for every instance -- exactly the cost this cache removes.
+        onnx_cache['input_shape'] = input_shape
     
     # Parse VNNLIB to get input tensor
     logger.info("[3/3] Parsing VNNLIB specification...")
@@ -578,7 +614,7 @@ def load_vnnlib_pair(
     logger.info(f"Successfully loaded VNNLIB instance from '{category}'")
     
     result = {
-        'model': pytorch_model,
+        'model': model,
         'labeled_tensor': labeled_tensor,
         'vnnlib_metadata': vnnlib_metadata,
         'onnx_path': str(onnx_path),
@@ -588,7 +624,6 @@ def load_vnnlib_pair(
         'vnnlib_spec': vnnlib_spec
     }
     if pytorch_model_g is not None and onnx_path_g is not None:
-        result['model'] = _CombinedDualModel(pytorch_model, pytorch_model_g)
         result['model_f'] = pytorch_model
         result['model_g'] = pytorch_model_g
         result['onnx_path_g'] = str(onnx_path_g)

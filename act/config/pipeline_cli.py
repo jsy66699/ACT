@@ -21,7 +21,7 @@ import torch
 
 from act.util.cli_utils import add_device_args, initialize_from_args
 from act.util.format_utils import rule
-from act.config.config import VALID_SOLVER_TIERS
+from act.config.config import VALID_BOUNDINGS, VALID_SOLVER_TIERS
 
 logger = logging.getLogger(__name__)
 from act.front_end.specs import OutputSpec
@@ -31,7 +31,7 @@ from act.front_end.vnnlib_loader import category_mapping as vnnlib_mapping
 from act.front_end.torchvision_loader.create_specs import TorchVisionSpecCreator
 from act.front_end.torchvision_loader import data_model_loader as tv_loader
 from act.front_end.torchvision_loader import data_model_mapping as tv_mapping
-from act.front_end.model_synthesis import synthesize_models_from_specs
+from act.front_end.model_synthesis import synthesize_models_and_seeds_from_specs
 from act.pipeline.fuzzing.actfuzzer import ACTFuzzer, FuzzingConfig
 from act.pipeline.verification.per_neuron_bounds import PerNeuronCheckConfig
 from act.config.config import PipelineConfig
@@ -60,6 +60,9 @@ _FUZZ_OVERRIDE_SPEC: list[tuple[str, str, str, Any]] = [
     ("trace_storage", "--trace-storage", "trace_storage", str),
     ("trace_output", "--trace-output", "trace_output", Path),
     ("stop_on_first_violation", "--stop-on-first-violation", "stop_on_first_violation", bool),
+    ("dtype", "--dtype", "dtype", str),
+    ("pgd_restarts", "--pgd-restarts", "pgd_restarts", int),
+    ("pgd_restarts_binarized", "--pgd-restarts-binarized", "pgd_restarts_binarized", int),
 ]
 
 
@@ -149,6 +152,18 @@ def _add_fuzz_config_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Stop after the first counterexample (default: from config.yaml/FuzzingConfig default)",
     )
+    group.add_argument(
+        "--pgd-restarts",
+        type=int,
+        default=None,
+        help="PGD random starts per mutation (default: from config.yaml)",
+    )
+    group.add_argument(
+        "--pgd-restarts-binarized",
+        type=int,
+        default=None,
+        help="PGD random starts per mutation on binarized networks (default: from config.yaml)",
+    )
 
 
 def _collect_fuzzing_overrides(args: Any) -> dict[str, Any]:
@@ -176,11 +191,12 @@ _PIPELINE_BAB_ATTR_MAP: dict[str, str] = {
     "max_depth": "bab_max_depth",
     "max_nodes": "bab_max_nodes",
     "branching_method": "bab_branching_method",
-    "bounding_method": "bab_bounding_method",
-    "bounding_order": "bab_bounding_order",
+    "bounding": "bab_bounding",
     "sa_cooling_rate": "bab_sa_cooling_rate",
     "frontier_cap": "bab_frontier_cap",
+    "top_k": "bab_top_k",
     "input_split_fanout": "bab_input_split_fanout",
+    "multi_split_levels": "bab_multi_split_levels",
     "provenance_enabled": "bab_provenance",
 }
 _PIPELINE_VAL_ATTR_MAP: dict[str, str] = {
@@ -231,15 +247,18 @@ def _collect_pipeline_config_overrides(args: Any) -> dict[str, Any]:
 
 def _apply_pipeline_config_defaults(args: Any) -> PipelineConfig:
     config = PipelineConfig.from_yaml(**_collect_pipeline_config_overrides(args))
+    if getattr(args, "dtype", None) is None:
+        args.dtype = FuzzingConfig.from_yaml().dtype
     args.bab_solver_tier = config.bab.solver_tier
     args.bab_max_depth = config.bab.max_depth
     args.bab_max_nodes = config.bab.max_nodes
     args.bab_branching_method = config.bab.branching_method
-    args.bab_bounding_method = config.bab.bounding_method
-    args.bab_bounding_order = config.bab.bounding_order
+    args.bab_bounding = config.bab.bounding
     args.bab_sa_cooling_rate = config.bab.sa_cooling_rate
     args.bab_frontier_cap = config.bab.frontier_cap
+    args.bab_top_k = config.bab.top_k
     args.bab_input_split_fanout = config.bab.input_split_fanout
+    args.bab_multi_split_levels = config.bab.multi_split_levels
     args.bab_per_class_alpha = "true" if config.dual.per_class_alpha else "false"
     args.bab_no_incremental_start = not config.dual.incremental_start_enabled
     args.bab_provenance = config.bab.provenance_enabled
@@ -534,8 +553,6 @@ def cmd_fuzz(args):
     print(f"{rule()}\n")
 
     spec_results = []
-    initial_seeds = []
-
     try:
         if creator == "vnnlib":
             spec_creator = VNNLibSpecCreator()
@@ -646,7 +663,9 @@ def cmd_fuzz(args):
     VerifiableModel.set_strict_mode(args.strict_mode)
 
     try:
-        wrapped_models = synthesize_models_from_specs(cast(Any, spec_results))
+        wrapped_models, synthesized_seeds = synthesize_models_and_seeds_from_specs(
+            cast(Any, spec_results), cd_group="shape"
+        )
     except Exception as e:
         print(f"❌ Model synthesis failed: {e}")
         import traceback
@@ -665,9 +684,8 @@ def cmd_fuzz(args):
     print(f"STEP 3: Seed Extraction")
     print(f"{rule()}\n")
 
-    # Single model only; mixing seeds across spec_results breaks SeedCorpus(torch.cat).
-    _, _, _, labeled_tensors, _ = spec_results[0]
-    initial_seeds.extend(labeled_tensors)
+    model_id = list(wrapped_models.keys())[0]
+    initial_seeds = synthesized_seeds[model_id]
 
     if not initial_seeds:
         print("❌ No initial seeds extracted!")
@@ -680,7 +698,6 @@ def cmd_fuzz(args):
     print(f"STEP 4: Fuzzing")
     print(f"{rule()}\n")
 
-    model_id = list(wrapped_models.keys())[0]
     wrapped_model = wrapped_models[model_id]
 
     print(f"Fuzzing model: {model_id}\n")
@@ -938,15 +955,32 @@ def _sliced_net_view(net, sample_idx: int, batch_size: int):
     orig_spec_params = [deepcopy(spec_layer.params) for spec_layer in spec_layers]
     orig_input_outvars = list(input_layer.out_vars)
     try:
-        for key in OutputSpec.SLICEABLE_PARAM_KEYS:
-            val = orig_assert_params.get(key)
-            if (
-                val is not None
-                and hasattr(val, "dim")
-                and val.dim() >= 1
-                and val.shape[0] == batch_size
-            ):
-                assert_layer.params[key] = val[sample_idx : sample_idx + 1]
+        assert_kind = orig_assert_params.get("kind")
+        if not isinstance(assert_kind, str):
+            raise TypeError(
+                f"ASSERT kind must be str, got {type(assert_kind).__name__}"
+            )
+        reference = next(
+            (
+                value
+                for value in orig_assert_params.values()
+                if isinstance(value, torch.Tensor) and value.is_floating_point()
+            ),
+            None,
+        )
+        if reference is None:
+            raise RuntimeError("ASSERT params contain no floating tensor for slicing")
+        assert_layer.params.update(
+            OutputSpec(kind=assert_kind)._gather_rows(
+                rows=torch.tensor([sample_idx], device=reference.device),
+                batch_size=1,
+                device=reference.device,
+                dtype=reference.dtype,
+                shared_ndim={},
+                source=orig_assert_params,
+                source_batch_size=batch_size,
+            )
+        )
 
         for spec_layer, sp_orig in zip(spec_layers, orig_spec_params):
             for sp_key, sp_val in sp_orig.items():
@@ -1472,30 +1506,60 @@ Examples:
         type=str,
         default=None,
         choices=["random", "babsr", "fsb", "gain", "width"],
-        help="BaB branching strategy when --bab is set (default: from config.yaml)",
-    )
-    bab_group.add_argument(
-        "--bab-bounding-method",
-        type=str,
-        default=None,
-        choices=["random", "topk"],
         help=(
-            "Pool selection when subproblems exceed the batch size: 'random' or "
-            "'topk' (keep the top-k by depth + lower-bound). Default: from config.yaml."
+            "BaB branching strategy when --bab is set: which neuron or input "
+            "axis to split. Neuron branching (babsr/fsb/gain) "
+            "requires --bab-solver-tier dual_alpha or dual_alpha_eta. "
+            "--bab-multi-split-levels is orthogonal to this choice. "
+            "Default: from config.yaml."
         ),
     )
     bab_group.add_argument(
-        "--bab-bounding-order",
+        "--bab-bounding",
         type=str,
         default=None,
-        choices=["depth_lb", "greedy", "sa"],
-        help="TopKBounding order policy (default: from config.yaml)",
+        choices=list(VALID_BOUNDINGS),
+        help=(
+            "Pool selection when subproblems exceed the batch size. "
+            "'depth_bound_blend' = 0.5*norm(depth) + 0.5*bound-urgency blend; "
+            "'greedy' = best-first on |lb| (Oliva-Greedy, ECOOP 2025); "
+            "'annealed' = Gumbel noise, temp = sa_cooling_rate**step "
+            "(Oliva-SA, ECOOP 2025); "
+            "'diverse_split_signs' = top-k then split-sign diversity repulsion; "
+            "'random' = uniform sampling; 'mcts' = N/Q side tables over the BaB "
+            "tree. The first four honour --bab-top-k; random and mcts reject it. "
+            "Default: from config.yaml."
+        ),
+    )
+    bab_group.add_argument(
+        "--bab-top-k",
+        type=int,
+        default=None,
+        help=(
+            "Cap on subproblems popped per BaB wave, independent of the batch "
+            "size; 0 = unbounded. Honoured by --bab-bounding "
+            "depth_bound_blend/greedy/annealed/diverse_split_signs; rejected "
+            "for random/mcts (default: from config.yaml)"
+        ),
+    )
+    bab_group.add_argument(
+        "--bab-multi-split-levels",
+        type=int,
+        default=None,
+        help=(
+            "Neurons split jointly per branching step; each lane fans out into "
+            "all 2^k sign combinations (verdict-boundary joint splitting). "
+            "1 = single split. With --bab-multi-split-levels > 1 the k neurons "
+            "are chosen by the BaBSR heuristic (area x |nu|) regardless of "
+            "--bab-branching-method. Requires --bab-solver-tier dual_alpha or "
+            "dual_alpha_eta (default: from config.yaml)"
+        ),
     )
     bab_group.add_argument(
         "--bab-sa-cooling-rate",
         type=float,
         default=None,
-        help="Cooling rate for --bab-bounding-order sa (default: from config.yaml)",
+        help="Cooling rate for --bab-bounding annealed (default: from config.yaml)",
     )
     bab_group.add_argument(
         "--bab-per-class-alpha",
@@ -1529,7 +1593,7 @@ Examples:
         "--bab-provenance",
         action="store_true",
         default=None,
-        help="Enable node_id/parent_id provenance sidecar (requires --bab-bounding-method topk).",
+        help="Enable node_id/parent_id provenance sidecar (requires --bab-bounding other than random).",
     )
 
     # Fuzzing configuration
@@ -1690,7 +1754,7 @@ Examples:
     )
 
     # Add standard device/dtype arguments (shared across all ACT CLIs)
-    add_device_args(parser)
+    add_device_args(parser, default_dtype=None)
 
     _add_fuzz_config_args(parser)
 

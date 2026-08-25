@@ -17,8 +17,8 @@
 #   Joint multi-neuron splitting (``_multi_split_from_decision``): split each lane's
 #   top-k BaBSR-scored neurons together into all 2^k sign combinations (one "skip"
 #   instead of k greedy single splits); gains are super-additive.
-#     * ``MultiNeuronSplitBranching`` — "Mining Verdict Boundaries for Neural Network
-#       Verification", Jiawei Ren, Guanqin Zhang, Zhenya Zhang, Yulei Sui, FM 2026.
+#     * "Mining Verdict Boundaries for Neural Network Verification",
+#       Jiawei Ren, Guanqin Zhang, Zhenya Zhang, Yulei Sui, FM 2026.
 #
 #   Strategies (subclasses of ``BranchingStrategy``):
 #     * ``RandomBranching`` — uniform-random over eligible dims (width-weighted for
@@ -52,7 +52,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from act.back_end.bab.node import SubproblemBatch
-from act.back_end.core import Bounds, Net
+from act.back_end.core import Bounds, Layer, Net
 from act.front_end.specs import InKind
 
 
@@ -395,6 +395,159 @@ class BaBSRBranching(BranchingStrategy):
         return SplitDecision(kind="neuron", layer_id=decisions_layer, neuron_idx=decisions_neuron)
 
 
+_WITNESS_GAP_TOL = 1e-6
+
+
+class WitnessResidualBranching(BaBSRBranching):
+    """Branch on the realized ReLU relaxation gap at the dual witness.
+
+    For an unstable ReLU with pre-activation interval ``[l, u]`` and witness
+    pre-activation ``z``, the triangle upper relaxation is
+    ``u / (u - l) * (z - l)``.  The score is the realized residual magnitude
+    ``Relaxed(z) - ReLU(z)`` masked to currently unstable, unsplit neurons.
+    Missing witness data falls back to BaBSR so the strategy remains usable on
+    paths whose solver does not expose an SCE.
+    """
+
+    def __init__(self, decision_threshold: float = 1e-12) -> None:
+        super().__init__(decision_threshold=decision_threshold)
+        self.fallback_count = 0
+        self.different_from_babsr_count = 0
+
+    track_babsr_disagreement: bool = False
+    """Opt-in: compare each decision against BaBSR and count divergences.
+
+    Off by default because it costs a second full BaBSR scoring pass on every
+    branching step and produces a number the verifier never consumes. Set it on
+    the class when studying how far this heuristic drifts from BaBSR.
+    """
+
+    def compute_scores(
+        self,
+        batch: SubproblemBatch,
+        net: Net,
+        unstable_mask: Optional[torch.Tensor] = None,
+        *,
+        bounds_dict: Optional[Dict[int, Bounds]] = None,
+        nu_per_layer: Optional[Dict[int, torch.Tensor]] = None,
+        witness_preact_per_layer: Optional[Dict[int, torch.Tensor]] = None,
+    ) -> BranchingScores:
+        if bounds_dict is None or witness_preact_per_layer is None:
+            self.fallback_count += int(batch.batch_size)
+            return super().compute_scores(
+                batch,
+                net,
+                unstable_mask,
+                bounds_dict=bounds_dict,
+                nu_per_layer=nu_per_layer,
+            )
+
+        per_layer: Dict[int, torch.Tensor] = {}
+        for lid, bounds in bounds_dict.items():
+            z_raw = witness_preact_per_layer.get(lid)
+            if z_raw is None:
+                continue
+            lb = bounds.lb.flatten(start_dim=1)
+            ub = bounds.ub.flatten(start_dim=1)
+            z = z_raw.flatten(start_dim=1).to(device=lb.device, dtype=lb.dtype)
+            n_neurons = min(lb.shape[-1], ub.shape[-1], z.shape[-1])
+            if n_neurons <= 0 or lb.shape[0] != batch.batch_size or z.shape[0] != batch.batch_size:
+                continue
+            lb_n = lb[:, :n_neurons]
+            ub_n = ub[:, :n_neurons]
+            z_n = z[:, :n_neurons]
+            ambiguous = (lb_n < 0) & (ub_n > 0)
+            split_mask = self._already_split_mask(batch, lid, n_neurons)
+            effective = ambiguous & ~split_mask
+            denom = torch.clamp(ub_n - lb_n, min=torch.finfo(lb_n.dtype).eps)
+            relaxed = ub_n / denom * (z_n - lb_n)
+            relu = z_n.clamp(min=0.0)
+            # On z in [l, u] the triangle relaxation dominates ReLU, so the gap
+            # is non-negative. A negative gap means the witness pre-activation
+            # escaped this layer's own bounds (stale bounds, or a witness from a
+            # different subproblem). clamp(min=0) neutralises it; abs() would
+            # instead turn the violation into a HIGH score and steer branching
+            # straight at the corrupted neuron.
+            gap = relaxed - relu
+            assert not bool(
+                (gap[effective] < -_WITNESS_GAP_TOL).any().item()
+            ), f"witness pre-activation outside layer {lid} bounds"
+            score = gap.clamp(min=0.0).masked_fill(~effective, float("-inf"))
+            per_layer[lid] = score
+
+        if not per_layer or not any(bool(torch.isfinite(score).any().item()) for score in per_layer.values()):
+            self.fallback_count += int(batch.batch_size)
+            return super().compute_scores(
+                batch,
+                net,
+                unstable_mask,
+                bounds_dict=bounds_dict,
+                nu_per_layer=nu_per_layer,
+            )
+
+        if self.track_babsr_disagreement:
+            self._record_babsr_disagreement(
+                batch, net, unstable_mask, bounds_dict, nu_per_layer, per_layer
+            )
+        return BranchingScores(flat=None, per_layer=per_layer, intercept_per_layer=None)
+
+    def _record_babsr_disagreement(
+        self,
+        batch: SubproblemBatch,
+        net: Net,
+        unstable_mask: Optional[torch.Tensor],
+        bounds_dict: Dict[int, Bounds],
+        nu_per_layer: Optional[Dict[int, torch.Tensor]],
+        witness_scores: Dict[int, torch.Tensor],
+    ) -> None:
+        if nu_per_layer is None:
+            return
+        babsr = super().compute_scores(
+            batch,
+            net,
+            unstable_mask,
+            bounds_dict=bounds_dict,
+            nu_per_layer=nu_per_layer,
+        )
+        if babsr.per_layer is None:
+            return
+        wr_choice, wr_valid = self._best_pairs(witness_scores)
+        babsr_choice, babsr_valid = self._best_pairs(babsr.per_layer)
+        if wr_choice is None or babsr_choice is None:
+            return
+        both_valid = wr_valid & babsr_valid
+        differ = (wr_choice != babsr_choice).any(dim=1) & both_valid
+        self.different_from_babsr_count += int(differ.sum().item())
+
+    def _best_pairs(
+        self, scores: Dict[int, torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Argmax over the concatenated (layer, neuron) axis, one row per lane.
+
+        Returns ``([K, 2]`` tensor of ``(layer_id, neuron_idx)``, ``[K]`` validity
+        mask). Concatenating first keeps this to a single ``argmax`` and one host
+        sync, instead of a ``.item()`` per lane per layer.
+        """
+        if not scores:
+            return None, torch.zeros(0, dtype=torch.bool)
+        layer_ids = sorted(scores)
+        flat = torch.cat([scores[lid] for lid in layer_ids], dim=1)
+        widths = [scores[lid].shape[1] for lid in layer_ids]
+        offsets = torch.tensor(
+            [0, *widths[:-1]], device=flat.device, dtype=torch.long
+        ).cumsum(0)
+        owner = torch.repeat_interleave(
+            torch.tensor(layer_ids, device=flat.device, dtype=torch.long),
+            torch.tensor(widths, device=flat.device, dtype=torch.long),
+        )
+        start = torch.repeat_interleave(
+            offsets, torch.tensor(widths, device=flat.device, dtype=torch.long)
+        )
+        best_val, best_col = flat.max(dim=1)
+        pairs = torch.stack([owner[best_col], best_col - start[best_col]], dim=1)
+        return pairs, torch.isfinite(best_val)
+
+
 def _preact_bias_of(net: Net, lid: int) -> torch.Tensor:
     layer = net.by_id[lid]
     n_neurons = len(layer.out_vars)
@@ -438,7 +591,8 @@ def _perturbed_embedding_input_mask(net: Optional[Net], batch: SubproblemBatch) 
         embed_dim = int(center.shape[-1])
         from act.front_end.specs import normalize_position_mask
 
-        positions = layer.params.get("perturbed_positions")
+        positions_raw = layer.params.get("perturbed_positions")
+        positions = positions_raw if isinstance(positions_raw, (torch.Tensor, list, tuple)) else None
         if (
             isinstance(positions, torch.Tensor)
             and positions.dtype == torch.bool
@@ -678,7 +832,7 @@ class FSBBranching(BaBSRBranching):
             for key, value in batch.split_signs.items():
                 hypo[key] = value.clone()
 
-        n_neurons = len(net.by_id[lid].out_vars)
+        n_neurons = _layer_neuron_count(net.by_id[lid])
         n_specs = 1
         if batch.incremental_alpha is not None and lid in batch.incremental_alpha:
             n_specs = int(batch.incremental_alpha[lid].shape[1])
@@ -714,6 +868,8 @@ def _build_branching_strategy(
         return InputBranching()
     if method == "babsr":
         return BaBSRBranching()
+    if method == "witness_residual":
+        return WitnessResidualBranching()
     if method == "fsb":
         if dual_solver is None:
             raise ValueError("FSB branching requires a dual_solver instance (inject via factory).")
@@ -723,6 +879,10 @@ def _build_branching_strategy(
 
 # ---------------------------------------------------------------------------
 # Joint multi-neuron splitting (verdict-boundary)
+#
+#   "Mining Verdict Boundaries for Neural Network Verification"
+#   Jiawei Ren, Guanqin Zhang, Zhenya Zhang, Yulei Sui
+#   FM 2026
 # ---------------------------------------------------------------------------
 
 
@@ -810,6 +970,111 @@ def enumerate_unstable_candidates(
     return out
 
 
+def _layer_neuron_count(layer: Layer) -> int:
+    """Width of a layer's output block.
+
+    Derived from the variable-id span rather than ``len(out_vars)`` so that the
+    sign tensors stay aligned with the solver's flat variable indexing even if a
+    layer ever declares a non-contiguous ``out_vars`` list.
+    """
+    span = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
+    assert span == len(layer.out_vars), (
+        f"layer {layer.id} has non-contiguous out_vars: span {span} != "
+        f"{len(layer.out_vars)} declared variables"
+    )
+    return span
+
+
+def _index_subproblem_batch(
+    batch: SubproblemBatch, lanes: torch.Tensor
+) -> SubproblemBatch:
+    """Restrict every field of ``batch`` to the given lane indices."""
+
+    def _pick(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        return None if t is None else t.index_select(0, lanes.to(t.device))
+
+    def _pick_dict(
+        state: Optional[Dict[int, torch.Tensor]]
+    ) -> Optional[Dict[int, torch.Tensor]]:
+        if state is None:
+            return None
+        return {l: t.index_select(0, lanes.to(t.device)) for l, t in state.items()}
+
+    return SubproblemBatch(
+        lb=batch.lb.index_select(0, lanes.to(batch.lb.device)),
+        ub=batch.ub.index_select(0, lanes.to(batch.ub.device)),
+        depths=batch.depths.index_select(0, lanes.to(batch.depths.device)),
+        incremental_alpha=_pick_dict(batch.incremental_alpha),
+        incremental_eta=_pick_dict(batch.incremental_eta),
+        split_signs=_pick_dict(batch.split_signs),
+        parent_margins=_pick(batch.parent_margins),
+        lower_bound=_pick(batch.lower_bound),
+        node_id=_pick(batch.node_id),
+        parent_id=_pick(batch.parent_id),
+    )
+
+
+def _concat_subproblem_batches(
+    a: SubproblemBatch, b: SubproblemBatch
+) -> SubproblemBatch:
+    """Stack two child batches that were split at different depths.
+
+    The per-layer state dicts may disagree on their key sets: a layer touched
+    only by one group's selection exists there and not in the other. A missing
+    key means "no neuron of this layer is constrained", which is exactly what an
+    all-zero sign block encodes, so padding with zeros preserves each side's
+    feasible region rather than widening or narrowing it.
+    """
+
+    def _cat(x: Optional[torch.Tensor], y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None or y is None:
+            return None
+        return torch.cat([x, y.to(device=x.device, dtype=x.dtype)], dim=0)
+
+    def _cat_dict(
+        x: Optional[Dict[int, torch.Tensor]],
+        y: Optional[Dict[int, torch.Tensor]],
+        n_x: int,
+        n_y: int,
+    ) -> Optional[Dict[int, torch.Tensor]]:
+        if not x and not y:
+            return None
+        x = x or {}
+        y = y or {}
+        out: Dict[int, torch.Tensor] = {}
+        for lid in sorted(set(x) | set(y)):
+            present = x.get(lid)
+            if present is None:
+                present = y[lid]
+            trailing = present.shape[1:]
+            left = x.get(lid)
+            if left is None:
+                left = torch.zeros(
+                    (n_x, *trailing), dtype=present.dtype, device=present.device
+                )
+            right = y.get(lid)
+            if right is None:
+                right = torch.zeros(
+                    (n_y, *trailing), dtype=present.dtype, device=present.device
+                )
+            out[lid] = torch.cat([left, right.to(device=left.device)], dim=0)
+        return out
+
+    n_a, n_b = a.batch_size, b.batch_size
+    return SubproblemBatch(
+        lb=torch.cat([a.lb, b.lb.to(a.lb.device)], dim=0),
+        ub=torch.cat([a.ub, b.ub.to(a.ub.device)], dim=0),
+        depths=torch.cat([a.depths, b.depths.to(a.depths.device)], dim=0),
+        incremental_alpha=_cat_dict(a.incremental_alpha, b.incremental_alpha, n_a, n_b),
+        incremental_eta=_cat_dict(a.incremental_eta, b.incremental_eta, n_a, n_b),
+        split_signs=_cat_dict(a.split_signs, b.split_signs, n_a, n_b),
+        parent_margins=_cat(a.parent_margins, b.parent_margins),
+        lower_bound=_cat(a.lower_bound, b.lower_bound),
+        node_id=_cat(a.node_id, b.node_id),
+        parent_id=_cat(a.parent_id, b.parent_id),
+    )
+
+
 def _multi_split_from_groups(
     batch: SubproblemBatch,
     net: Net,
@@ -841,7 +1106,7 @@ def _multi_split_from_groups(
     for lid_val in torch.unique(top_layers).tolist():
         lid_int = int(lid_val)
         layer = net.by_id[lid_int]
-        n_neurons = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
+        n_neurons = _layer_neuron_count(layer)
         if lid_int not in signs:
             signs[lid_int] = torch.zeros(
                 n_children * n_lanes, m_specs, n_neurons,
@@ -857,6 +1122,11 @@ def _multi_split_from_groups(
             for j in range(n_children):
                 sign_val = 1.0 if (j >> bit) & 1 else -1.0
                 rows = j * n_lanes + lane_sel
+                # Two index tensors separated by a `:` slice broadcast against
+                # EACH OTHER to shape [len(rows), m_specs] — positional pairing
+                # rows[i] <-> neuron_sel[i], not an outer product. Do not rewrite
+                # as signs[lid_int][rows][:, :, neuron_sel] = ...: that indexes a
+                # copy, so the assignment silently no-ops.
                 signs[lid_int][rows, :, neuron_sel] = sign_val
 
     children = SubproblemBatch(
@@ -898,8 +1168,14 @@ def _multi_split_from_decision(
     neuron is constrained to >=0 or <=0 in both directions across the
     combination set), so replacing the lane by its children is sound. Joint
     splits are super-additive in bound gain versus greedy single splits.
-    Returns None when fewer than ``k_levels`` finite candidates exist in some
-    lane (caller falls back to single-split).
+
+    Lanes are grouped by how many finite candidates they actually have, so a
+    single candidate-starved lane no longer collapses ``k_eff`` for the whole
+    wave: lanes with >=2 candidates take the joint split, lanes with exactly one
+    take a plain 2-child split, and the two groups are concatenated. Returns
+    None only when some lane has no splittable neuron at all, since neuron
+    branching cannot cover such a lane and the caller must fall back to the
+    decision path (which can still split an input axis).
     """
     if bounds_dict is None or nu_per_layer is None:
         return None
@@ -908,10 +1184,34 @@ def _multi_split_from_decision(
         return None
     all_scores, all_layers, all_neurons = cand
     finite_per_lane = torch.isfinite(all_scores).sum(dim=1)
-    k_eff = min(k_levels, int(finite_per_lane.min().item()))
-    if k_eff < 2:
+    if int(finite_per_lane.min().item()) < 1:
         return None
-    top = torch.topk(all_scores, k=k_eff, dim=1).indices
-    top_layers = all_layers.gather(1, top)
-    top_neurons = all_neurons.gather(1, top)
-    return _multi_split_from_groups(batch, net, top_layers, top_neurons, k_eff)
+    k_lane = finite_per_lane.clamp(max=k_levels)
+    joint_mask = k_lane >= 2
+    if not bool(joint_mask.any().item()):
+        return None
+
+    def _group(lanes: torch.Tensor, k: int) -> Tuple[SubproblemBatch, torch.Tensor]:
+        sub = _index_subproblem_batch(batch, lanes)
+        scores = all_scores.index_select(0, lanes)
+        top = torch.topk(scores, k=k, dim=1).indices
+        children, local_parent = _multi_split_from_groups(
+            sub,
+            net,
+            all_layers.index_select(0, lanes).gather(1, top),
+            all_neurons.index_select(0, lanes).gather(1, top),
+            k,
+        )
+        return children, lanes.to(local_parent.device).index_select(0, local_parent)
+
+    k_eff = min(k_levels, int(finite_per_lane[joint_mask].min().item()))
+    lanes_joint = torch.where(joint_mask)[0]
+    lanes_single = torch.where(~joint_mask)[0]
+    joint_children, joint_parent = _group(lanes_joint, k_eff)
+    if lanes_single.numel() == 0:
+        return joint_children, joint_parent
+    single_children, single_parent = _group(lanes_single, 1)
+    return (
+        _concat_subproblem_batches(joint_children, single_children),
+        torch.cat([joint_parent, single_parent]),
+    )

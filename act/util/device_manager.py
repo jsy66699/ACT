@@ -14,7 +14,35 @@ except Exception:
 _INITIALIZED = False
 
 
-def initialize_device(device: str = 'cuda', dtype: str = 'float64') -> None:
+def _apply_precision_policy() -> str:
+    """Keep float32 matmul and convolution at full float32 precision.
+
+    TF32 truncates the float32 mantissa to 10 bits, which silently makes the
+    analysed network differ from the one on disk. Deliberately not
+    configurable: it is a correctness invariant, not a tuning knob.
+
+    Returns:
+        Description of the resulting precision state, for the startup banner.
+
+    Raises:
+        RuntimeError: If either backend still reports TF32 as enabled, which
+            means this torch build no longer honours these setters.
+    """
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if torch.backends.cudnn.allow_tf32 or torch.backends.cuda.matmul.allow_tf32:
+        raise RuntimeError(
+            "Refusing to run with TF32 enabled: float32 convolutions would use "
+            "a 10-bit mantissa and the analysed network would differ from the "
+            "file on disk. Setters did not take effect "
+            f"(cudnn={torch.backends.cudnn.allow_tf32}, "
+            f"matmul={torch.backends.cuda.matmul.allow_tf32}); this torch "
+            f"version ({torch.__version__}) may have changed their semantics."
+        )
+    return "tf32=off"
+
+
+def initialize_device(device: str, dtype: str) -> None:
     """
     Explicitly initialize device and dtype settings.
     
@@ -23,7 +51,10 @@ def initialize_device(device: str = 'cuda', dtype: str = 'float64') -> None:
     
     Args:
         device: Computation device - 'cpu', 'cuda', or 'gpu' (gpu aliased to cuda)
-        dtype: PyTorch data type - 'float32' or 'float64'
+        dtype: PyTorch data type - 'float32' or 'float64'. Required, so that
+            each tier's config YAML stays the single authority for its own
+            value: the pipeline tier runs float32 and the back_end tier
+            float64, and no shared default can silently answer for either.
     
     Examples:
         # In CLI after parsing args:
@@ -75,14 +106,20 @@ def initialize_device(device: str = 'cuda', dtype: str = 'float64') -> None:
         torch.set_default_dtype(target_dtype)
         if hasattr(torch, 'set_default_device'):
             torch.set_default_device(target_device)
-        
-        print(f"✅ Device Manager Initialized: device={target_device}, dtype={target_dtype}")
+
+        precision = _apply_precision_policy()
+
+        print(
+            f"✅ Device Manager Initialized: device={target_device}, "
+            f"dtype={target_dtype}, {precision}"
+        )
         _INITIALIZED = True
         
     except Exception as e:
         print(f"❌ Device initialization failed: {e}")
         print(f"   Falling back to CPU + float64")
         torch.set_default_dtype(torch.float64)
+        _apply_precision_policy()
         _INITIALIZED = True
 
 
@@ -158,8 +195,10 @@ def _ensure_initialized():
             if hasattr(torch, 'set_default_device'):
                 torch.set_default_device(target_device)
             
+            _apply_precision_policy()
             _INITIALIZED = True
         except Exception:
             # Silent fallback to CPU + float64
             torch.set_default_dtype(torch.float64)
+            _apply_precision_policy()
             _INITIALIZED = True

@@ -103,6 +103,20 @@ fuzzing:
   gce_hamming_radius: 3
   gce_noise_scale: 0.05
 
+  # Tensor dtype for this tier. Deliberately float32 while backend.yaml is
+  # float64 -- this is not an oversight. The pipeline tier fuzzes ONNX models
+  # whose weights are natively float32, so float32 IS the network on disk and
+  # is what every measurement to date was taken at; the back_end verifier wants
+  # float64 for numerical stability in LP and branch-and-bound.
+  dtype: "float32"
+
+  # Independent PGD random starts per mutation; the best lane-wise result wins
+  # and restarts stop early once every lane violates. 1 = single start.
+  pgd_restarts: 1
+  # Used instead of pgd_restarts once sign estimators are installed, which only
+  # happens on a binarized network.
+  pgd_restarts_binarized: 40
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Verification  (Branch-and-Bound)
 # ─────────────────────────────────────────────────────────────────────────────

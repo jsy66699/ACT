@@ -19,6 +19,30 @@ _VALID_DTYPES = {"float32", "float64"}
 _VALID_REGISTRY_MODES = {"intersection", "union"}
 _VALID_COVERAGE_MODES = {"basic", "full"}
 VALID_SOLVER_TIERS: Final[tuple[str, ...]] = ("lp", "dual", "dual_alpha", "dual_alpha_eta")
+# BaB subproblem-pool selection strategies (``--bab-bounding``).
+#
+#   value                | pool class          | order function                       | --bab-top-k | reference
+#   ---------------------|---------------------|--------------------------------------|-------------|----------
+#   depth_bound_blend    | TopKBounding        | DepthLowerBoundOrder (depth+urgency) | honoured    | default
+#   greedy               | TopKBounding        | GreedyOrder (best-first on |lb|)     | honoured    | Oliva-Greedy, ECOOP 2025
+#   annealed             | TopKBounding        | SAOrder (Gumbel, cooling_rate**step) | honoured    | Oliva-SA, ECOOP 2025
+#   diverse_split_signs  | DiverseTopKBounding | any order + split-sign repulsion     | honoured    | PR #106
+#   random               | RandomBounding      | none (uniform sampling)              | ValueError  | baseline
+#   mcts                 | MCTSBounding        | DepthLowerBoundOrder (pinned)        | ValueError  | docs/design/mcts_bab.md
+#
+# The first four share the TopKBounding pool and therefore honour ``top_k``;
+# ``random`` and ``mcts`` do not rank by an order function, so passing
+# ``top_k`` with them is a configuration error rather than a silent no-op.
+VALID_BOUNDINGS: Final[tuple[str, ...]] = (
+    "depth_bound_blend",
+    "greedy",
+    "annealed",
+    "diverse_split_signs",
+    "random",
+    "mcts",
+)
+TOP_K_BOUNDINGS: Final[tuple[str, ...]] = VALID_BOUNDINGS[:4]
+TOP_K_INCOMPATIBLE_BOUNDINGS: Final[tuple[str, ...]] = VALID_BOUNDINGS[4:]
 VALID_BERT_METHODS: Final[tuple[str, ...]] = (
     "planar",
     "rule",
@@ -91,14 +115,24 @@ class BaBConfig:
     max_depth: int = 20
     max_nodes: int = 2000
     frontier_cap: int = 0
+    top_k: int = 0
+    """Cap on how many pooled subproblems a single BaB wave may pop, independently
+    of the batch size. 0 = unbounded. Honoured by the TopKBounding family
+    (depth_bound_blend / greedy / annealed / diverse_split_signs); raises
+    ValueError with random / mcts, which do not rank the pool by an order
+    function. Unlike frontier_cap this never discards work: the remainder stays
+    pooled, so a smaller top_k only re-sorts priorities more often."""
+
     input_split_fanout: int = 2
 
     branching_method: str = "random"
-    bounding_method: str = "random"
-    bounding_order: str = "depth_lb"
+    bounding: str = "random"
     bounding_depth_weight: float = field(default=0.5, metadata={"in_yaml": False})
     bounding_bound_weight: float = field(default=0.5, metadata={"in_yaml": False})
     sa_cooling_rate: float = 0.99
+    mcts_exploration: float = 1.0
+    mcts_lambda: float = 0.5
+    mcts_virtual_loss: float = 1.0
 
     # Dual-tier solver knobs — support solver_tier="dual_alpha_eta" with
     # Iterative slope + Lagrange-multiplier optimization for the dual backward pass.
@@ -213,6 +247,17 @@ class BaBConfig:
         if self.solver_tier not in VALID_SOLVER_TIERS:
             raise ValueError(
                 f"Invalid solver_tier {self.solver_tier!r}; expected {VALID_SOLVER_TIERS}"
+            )
+        if self.bounding not in VALID_BOUNDINGS:
+            raise ValueError(
+                f"Invalid bounding {self.bounding!r}; expected {VALID_BOUNDINGS}"
+            )
+        if self.top_k < 0:
+            raise ValueError(f"top_k must be non-negative, got {self.top_k}")
+        if self.top_k > 0 and self.bounding in TOP_K_INCOMPATIBLE_BOUNDINGS:
+            raise ValueError(
+                f"top_k={self.top_k} is not supported by bounding={self.bounding!r}; "
+                f"it applies only to the order-ranked pools {TOP_K_BOUNDINGS}"
             )
         if self.method is not None:
             selection = select_bert_method(self.method)
@@ -721,8 +766,7 @@ def build_vnncomp_bab_config(
     common: dict[str, Any] = dict(
         solver_tier=solver_tier,
         branching_method=branching_method,
-        bounding_method="topk",
-        bounding_order="depth_lb",
+        bounding="depth_bound_blend",
         frontier_cap=25000,
         max_depth=max_depth,
         max_nodes=max_nodes,
@@ -730,7 +774,7 @@ def build_vnncomp_bab_config(
         intermediate_refine="all",
         presplit_levels=0,
         eta_only_children=False,
-        multi_split_levels=1 if branching_method != "gain" else max(1, int(multi_split_levels)),
+        multi_split_levels=max(1, int(multi_split_levels)),
     )
     dual_cfg = DualConfig(
         n_iters=dual_n_iters,

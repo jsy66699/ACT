@@ -87,8 +87,8 @@ Edit `act/config/pipeline.yaml` to customize:
 fuzzing:
   max_iterations: 10000
   mutation_weights:
-    gradient: 0.4      # FGSM-style
-    pgd: 0.0           # PGD-style (iterative; opt-in)
+    gradient: 0        # FGSM-style (single-step; disabled by default)
+    pgd: 0.4           # PGD-style (iterative; the active gradient strategy)
     activation: 0.3    # DeepXplore
     boundary: 0.2      # Edge cases
     random: 0.1        # Baseline
@@ -96,13 +96,16 @@ fuzzing:
 
 ## Mutation Strategies
 
-### 1. Gradient-Guided (FGSM) (40%)
+> **Note**: PGD is the active gradient strategy (`pgd: 0.4`); single-step FGSM is disabled by
+> default (`gradient: 0`). See `act/config/pipeline.yaml` for the authoritative values.
+
+### 1. Gradient-Guided (FGSM) (0% by default)
 Single-step FGSM-style perturbations:
 ```
 x' = x + ε * sign(∇_x Loss(x))
 ```
 
-### 2. Gradient-Guided (PGD) (0% by default)
+### 2. Gradient-Guided (PGD) (40%)
 Iterative PGD-style perturbations with projection each step:
 ```
 x_low  = x - ε
@@ -223,7 +226,7 @@ Coverage strategies (config `coverage_strategy`):
 - `BestInputCov`: Best input coverage values from all mutated inputs (tracks per-input coverage history; no global union)
 - `GlobalCov`: global union coverage across all inputs (supports never-activated neuron queries)
 
-A neuron "fired" if `activation > threshold` (default: 0.1).
+A neuron "fired" if `activation > threshold` (`activation_threshold`, default: 0.0001).
 
 ## Output
 
@@ -263,7 +266,7 @@ Typical performance on NVIDIA RTX 3090:
 ## Troubleshooting
 
 ### Out of Memory (OOM)
-- Reduce batch size (currently 1)
+- Reduce the number of instances per batched model (batch size = N VNNLib instances from model synthesis)
 - Use `--device cpu`
 - Lower `max_iterations`
 

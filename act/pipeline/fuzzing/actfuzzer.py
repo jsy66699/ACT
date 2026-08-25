@@ -14,14 +14,18 @@ from typing import List, Dict, Optional, Tuple, Any, cast
 import os
 import time
 import json
-import yaml
 import torch
 import torch.nn as nn
 from pathlib import Path
 
 from act.front_end.specs import InputSpec, OutputSpec
 from act.front_end.spec_creator_base import LabeledInputTensor
-from act.front_end.verifiable_model import InputSpecLayer, OutputSpecLayer
+from act.front_end.verifiable_model import (
+    InputLayer,
+    InputSpecLayer,
+    OutputSpecLayer,
+    VerifiableModel,
+)
 from act.pipeline.fuzzing.mutations import MutationEngine, _relu_sign_pattern_batched
 from act.pipeline.fuzzing.coverage import CoverageTracker
 from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
@@ -137,6 +141,20 @@ class FuzzingConfig:
     gce_margin: float = 0.01
     gce_hamming_radius: int = 3
     gce_noise_scale: float = 0.05
+
+    # Tensor dtype for the pipeline tier. See act/config/pipeline.yaml for why
+    # this deliberately differs from the back_end tier.
+    dtype: str = "float32"
+
+    # Independent PGD random starts per mutation; the best lane-wise result
+    # wins and restarts stop early once every lane violates. 1 = single start,
+    # i.e. no extra cost.
+    pgd_restarts: int = 1
+
+    # Used instead of pgd_restarts once sign estimators are installed, which
+    # only happens on a binarized network. Restarts alternate the estimator
+    # between its loose and tight eps.
+    pgd_restarts_binarized: int = 40
 
     def __post_init__(self):
         """Normalize output_dir to Path object."""
@@ -280,11 +298,37 @@ class ACTFuzzer:
         self.config = config or FuzzingConfig.from_yaml()
         self.device = get_default_device()
 
+        assert not VerifiableModel.get_strict_mode(), (
+            "ACTFuzzer requires VerifiableModel strict mode to be disabled; "
+            "violations must be returned to PropertyChecker, not raised by forward()"
+        )
         self.model = wrapped_model.to(self.device)
 
         # Extract specs for MutationEngine (projection) and PropertyChecker (violation detection).
         self.input_spec = cast(Optional[InputSpec], self._extract_spec(InputSpecLayer))
         self.output_spec = cast(Optional[OutputSpec], self._extract_spec(OutputSpecLayer))
+
+        input_layer = next(
+            (layer for layer in self.model.children() if isinstance(layer, InputLayer)),
+            None,
+        )
+        assert input_layer is not None, "ACTFuzzer requires an InputLayer"
+        assert initial_seeds, "ACTFuzzer requires at least one initial seed"
+        assert all(seed.tensor.shape[0] == 1 for seed in initial_seeds), (
+            "Each initial_seeds[i] must represent exactly one spec row"
+        )
+        seed_inputs = torch.cat([seed.tensor for seed in initial_seeds], dim=0).to(
+            device=input_layer.input_tensor.device,
+            dtype=input_layer.input_tensor.dtype,
+        )
+        assert seed_inputs.shape == input_layer.input_tensor.shape, (
+            "Initial seed count/shape must match synthesized spec rows: "
+            f"seeds={tuple(seed_inputs.shape)}, specs={tuple(input_layer.input_tensor.shape)}"
+        )
+        assert torch.equal(seed_inputs, input_layer.input_tensor), (
+            "initial_seeds[i] must equal InputLayer row i; original_index relies "
+            "on this seed/spec-row alignment"
+        )
 
         # Batch size is determined by model synthesis (number of VNNLib instances).
         self.batch_size = (
@@ -300,6 +344,8 @@ class ACTFuzzer:
             weights=self.config.mutation_weights,
             perturb_mode=self.config.perturb_mode,
             perturb_scale=self.config.perturb_scale,
+            pgd_restarts=self.config.pgd_restarts,
+            pgd_restarts_binarized=self.config.pgd_restarts_binarized,
         )
         self.coverage_tracker = CoverageTracker(
             model=self.model,
@@ -309,6 +355,10 @@ class ACTFuzzer:
         self.property_checker = PropertyChecker(self.output_spec)
         self.seed_corpus = SeedCorpus(
             initial_seeds=initial_seeds, strategy=self.config.seed_selection_strategy
+        )
+        assert len(self.seed_corpus) == self.batch_size, (
+            "Initial corpus must preserve exactly one seed slot per synthesized "
+            f"spec row: corpus={len(self.seed_corpus)}, specs={self.batch_size}"
         )
 
         # PatternStateManager: only built when actually needed (admission_mode
@@ -594,7 +644,10 @@ class ACTFuzzer:
         for ce in counterexamples:
             self.counterexamples.append(ce)
             if self.config.verbose >= 2:
-                print(f"🚨 Counterexample #{len(self.counterexamples)}: {ce.summary()}")
+                print(
+                    f"🚨 Counterexample #{len(self.counterexamples)}: "
+                    f"{ce.summary()}"
+                )
             if self.config.save_counterexamples:
                 self.config.output_dir.mkdir(parents=True, exist_ok=True)
                 ce.save(self.config.output_dir / f"ce_{len(self.counterexamples)}.pt")
@@ -608,11 +661,15 @@ class ACTFuzzer:
             energy=energies,
             depth=seeds.depth + 1,
             parent_id=seeds.id,
+            select_count=seeds.select_count,
         )
         self.seed_corpus.add(child_seeds, interesting_mask)
 
         # 9. Tracing ( per-sample for detail)
         if self.tracer:
+            counterexamples_by_lane = dict(
+                zip(violation_mask.nonzero(as_tuple=True)[0].tolist(), counterexamples)
+            )
             coverage = self.coverage_tracker.get_coverage()
             mutation_strategy = self.mutation_engine.last_strategy or "unknown"
             gradients = None
@@ -624,21 +681,11 @@ class ACTFuzzer:
             for i in range(batch_size):
                 iteration = start_iteration + i
                 if self.tracer.should_trace(iteration):
-                    # Build per-sample violation for tracer (None if no violation at this index)
-                    violation_at_i = None
-                    if violation_mask[i]:
-                        # Find the counterexample for this index (sparse search)
-                        seed_idx_val = int(seeds.original_index[i].item())
-                        for ce in counterexamples:
-                            if ce.seed_index == seed_idx_val:
-                                violation_at_i = ce
-                                break
-
                     self.tracer.record_iteration(
                         iteration=iteration,
                         timestamp=time.time(),
                         mutation_strategy=mutation_strategy,
-                        violation=violation_at_i,
+                        violation=counterexamples_by_lane.get(i),
                         coverage=coverage,
                         coverage_delta=global_delta / batch_size,
                         energy=float(energies[i]),
@@ -713,13 +760,6 @@ class ACTFuzzer:
             parent_id=anchors.id,
         )
         self.seed_corpus.add(child_seeds, admitted | violation_mask)
-
-    def _compute_energy(self, coverage_delta: float, found_violation: bool) -> float:
-        """Compute seed energy (higher = more interesting)."""
-        energy = coverage_delta * 10.0
-        if found_violation:
-            energy += 100.0  # Violations are very interesting
-        return max(energy, 0.1)  # Minimum energy
 
     def _print_progress(self, iteration: int):
         """Print fuzzing progress with incremental counterexample count."""

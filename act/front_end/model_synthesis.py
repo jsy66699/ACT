@@ -29,7 +29,7 @@ import copy
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Literal, Tuple, Optional
 
 # Import ACT components
 from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
@@ -216,12 +216,26 @@ def _merge_specs_to_batch(
         """Batch a field that only exists for certain output spec kinds (e.g. c/d for LINEAR_LE, lb/ub for RANGE). Returns None if this kind doesn't use the field."""
         vals = [getattr(s, attr, None) for s in out_specs]
         return torch.stack(vals) if all(v is not None for v in vals) else None
-    # c/d in (UNSAFE_)LINEAR are per-constraint (not per-sample): stacking would
-    # produce a spurious 3-D tensor OutputSpecLayer can't consume. Grouping below
-    # guarantees all items in one group already share the same (c, d).
     if out_kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE):
         c_vec = out_specs[0].c
-        d_vec = out_specs[0].d
+        if c_vec is not None:
+            c_ref = c_vec.detach().cpu().reshape(-1).numpy().tobytes()
+            assert all(
+                s.c is not None
+                and s.c.shape == c_vec.shape
+                and s.c.detach().cpu().reshape(-1).numpy().tobytes() == c_ref
+                for s in out_specs
+            ), f"{out_kind.name}: grouped lanes must share one c matrix"
+        d_all = [s.d for s in out_specs]
+        if (
+            len(d_all) > 1
+            and all(t is not None for t in d_all)
+            and all(t.shape == d_all[0].shape for t in d_all)
+            and not all(torch.equal(t, d_all[0]) for t in d_all)
+        ):
+            d_vec = torch.stack(d_all)
+        else:
+            d_vec = d_all[0]
     else:
         c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
     out_lb, out_ub = _batch_attr('lb'), _batch_attr('ub')
@@ -280,9 +294,14 @@ def _build_batched_model(
     return vm
 
 
-def synthesize_models_from_specs(
-    spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]
-) -> Dict[Tuple[str, str, str, str], nn.Module]:
+def synthesize_models_and_seeds_from_specs(
+    spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]],
+    *,
+    cd_group: Literal["value", "shape"] = "value",
+) -> Tuple[
+    Dict[Tuple[str, str, str, str], nn.Module],
+    Dict[Tuple[str, str, str, str], List[LabeledInputTensor]],
+]:
     """
     Synthesize wrapped models with automatic batching.
     
@@ -294,7 +313,8 @@ def synthesize_models_from_specs(
                               labeled_tensors, spec_pairs)
     
     Returns:
-        synthesis_models: Dict[(dataset, model, in_kind, out_kind), VerifiableModel]
+        A pair containing synthesized models and their spec-row-aligned seeds,
+        both keyed by (dataset, model, in_kind, out_kind).
     """
     from collections import defaultdict
     
@@ -329,10 +349,19 @@ def synthesize_models_from_specs(
             lt = labeled_tensors[min(idx // sps if sps > 0 else 0, len(labeled_tensors) - 1)]
             cd_sig: Any = None
             if out_spec.kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE) and out_spec.c is not None:
+                merge_d = (
+                    cd_group == "shape" and out_spec.kind is OutKind.UNSAFE_LINEAR
+                )
+                if out_spec.d is None:
+                    d_sig: Any = None
+                elif merge_d:
+                    d_sig = tuple(out_spec.d.shape)
+                else:
+                    d_sig = out_spec.d.detach().cpu().reshape(-1).numpy().tobytes()
                 cd_sig = (
                     tuple(out_spec.c.shape),
                     out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
-                    out_spec.d.detach().cpu().reshape(-1).numpy().tobytes() if out_spec.d is not None else None,
+                    d_sig,
                 )
             gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
             groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))
@@ -341,6 +370,9 @@ def synthesize_models_from_specs(
     # Synthesis Loop: Build batched models from grouped specs
     # -------------------------------------------------------------------------
     synthesis_models: Dict[Tuple[str, str, str, str], nn.Module] = {}
+    synthesis_seeds: Dict[
+        Tuple[str, str, str, str], List[LabeledInputTensor]
+    ] = {}
     disjunct_counter: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
     for gkey, grouped_specs in groups.items():
         data_src, mid, in_kind, out_kind, _cd_sig = gkey
@@ -357,6 +389,7 @@ def synthesize_models_from_specs(
             display_key = (data_src, f"{rep_name}#d{idx}", in_kind, out_kind)
         vm = _build_batched_model(display_key, grouped_specs, pytorch_model)
         synthesis_models[display_key] = vm
+        synthesis_seeds[display_key] = [item[0] for item in grouped_specs]
     
     # -------------------------------------------------------------------------
     # Summary: Print statistics and return results
@@ -366,7 +399,19 @@ def synthesize_models_from_specs(
     print(f"\n🎉 Synthesis Complete:")
     print(f"   Total specs: {total_specs}")
     print(f"   Wrapped models: {len(synthesis_models)}")
-    return synthesis_models 
+    return synthesis_models, synthesis_seeds
+
+
+def synthesize_models_from_specs(
+    spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]],
+    *,
+    cd_group: Literal["value", "shape"] = "value",
+) -> Dict[Tuple[str, str, str, str], nn.Module]:
+    """Synthesize wrapped models with automatic batching."""
+    synthesis_models, _ = synthesize_models_and_seeds_from_specs(
+        spec_results, cd_group=cd_group
+    )
+    return synthesis_models
 
 
 # -----------------------------------------------------------------------------

@@ -9,11 +9,18 @@ License: AGPLv3+
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from pathlib import Path
+from typing import Any, TYPE_CHECKING, Optional, List, Tuple, cast
 import time
 import torch
 
-from act.front_end.specs import OutputSpec, OutKind
+from act.front_end.specs import OutKind, OutputSpec
+
+if TYPE_CHECKING:
+    from act.pipeline.fuzzing.corpus import FuzzingSeed
+
+
+INPUT_FEASIBILITY_ATTR = "_act_input_satisfied_per_sample"
 
 
 @dataclass
@@ -27,56 +34,65 @@ class Counterexample:
     Attributes:
         input: Input tensor that caused violation (perturbed)
         output: Model's output on this input
-        expected: Expected value (e.g., true label)
-        actual: Actual value (e.g., predicted label)
+        seed_input: Original unperturbed input
         kind: Type of violation (TOP1_ROBUST, MARGIN_ROBUST, etc.)
-        confidence: Confidence score of the prediction
+        spec_row: OutputSpec row backing this counterexample
+        severity: Signed violation margin returned by OutputSpec.violation()
         timestamp: When the counterexample was found
-        seed_index: Which VNNLib instance (0..N-1) this counterexample belongs to
-        seed_input: Original unperturbed input (L∞ projection anchor and visualization baseline)
+        true_class: Label the spec row expected, resolved when the counterexample
+            was built. ``None`` for kinds that carry no label (RANGE, LINEAR_LE,
+            UNSAFE_LINEAR).
     """
     input: torch.Tensor
     output: torch.Tensor
-    expected: int
-    actual: int
+    seed_input: torch.Tensor
     kind: str
-    confidence: float
+    spec_row: int
+    severity: float
     timestamp: float
-    seed_index: Optional[int] = None
-    seed_input: Optional[torch.Tensor] = None
-    
+    true_class: Optional[int] = None
+
     def summary(self) -> str:
         """One-line summary of the counterexample."""
-        return f"{self.kind}: expected {self.expected}, got {self.actual} (conf={self.confidence:.3f})"
-    
-    def save(self, path):
-        """Save counterexample to disk."""
-        torch.save({
+        details = f"spec_row={self.spec_row}, severity={self.severity:.6g}"
+        if self.true_class is None:
+            return f"{self.kind}: {details}"
+        predicted_class = int(self.output.reshape(-1).argmax().item())
+        return (
+            f"{self.kind}: expected {self.true_class}, got {predicted_class} "
+            f"({details})"
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Convert the counterexample to its serialized representation."""
+        return {
             "input": self.input,
             "output": self.output,
-            "expected": self.expected,
-            "actual": self.actual,
-            "kind": self.kind,
-            "confidence": self.confidence,
-            "timestamp": self.timestamp,
-            "seed_index": self.seed_index,
             "seed_input": self.seed_input,
-        }, path)
-    
+            "kind": self.kind,
+            "spec_row": self.spec_row,
+            "severity": self.severity,
+            "timestamp": self.timestamp,
+            "true_class": self.true_class,
+        }
+
+    def save(self, path: str | Path) -> None:
+        """Save counterexample to disk."""
+        torch.save(self.to_dict(), path)
+
     @staticmethod
-    def load(path):
+    def load(path: str | Path) -> Counterexample:
         """Load counterexample from disk."""
-        data = torch.load(path)
+        data = cast(dict[str, Any], torch.load(path, weights_only=True))
         return Counterexample(
             input=data["input"],
             output=data["output"],
-            expected=data["expected"],
-            actual=data["actual"],
+            seed_input=data["seed_input"],
             kind=data["kind"],
-            confidence=data["confidence"],
+            spec_row=data["spec_row"],
+            severity=data["severity"],
             timestamp=data["timestamp"],
-            seed_index=data.get("seed_index"),
-            seed_input=data.get("seed_input")
+            true_class=data["true_class"],
         )
 
 
@@ -88,11 +104,12 @@ class PropertyChecker:
     """
     Vectorized property checker for violation detection.
     
-    Supports all OutKind types:
+    Supports all OutKind types through OutputSpec.violation():
     - TOP1_ROBUST: Top prediction must equal true label
     - MARGIN_ROBUST: Margin to runner-up must exceed threshold
     - RANGE: Output must be within [lb, ub]
     - LINEAR_LE: Linear constraint c^T y <= d must hold
+    - UNSAFE_LINEAR: Output must not enter the unsafe linear region
     
     Example:
         >>> checker = PropertyChecker(output_spec)
@@ -103,14 +120,7 @@ class PropertyChecker:
     def __init__(self, output_spec: Optional[OutputSpec]):
         """Initialize property checker."""
         self.spec = output_spec
-        
-        # Dispatch table for spec kinds
-        self._dispatch = {
-            OutKind.TOP1_ROBUST: self._check_top1,
-            OutKind.MARGIN_ROBUST: self._check_margin,
-            OutKind.RANGE: self._check_range,
-            OutKind.LINEAR_LE: self._check_linear,
-        }
+        self.infeasible_candidates = 0
     
     def check(
         self,
@@ -129,165 +139,83 @@ class PropertyChecker:
         Returns:
             Tuple of (violations_mask BoolTensor[B], List[Counterexample] for violations only)
         """
-        B = inputs.shape[0]
-        device = outputs.device
-        
         if self.spec is None:
-            return (torch.zeros(B, dtype=torch.bool, device=device), [])
+            raise ValueError("PropertyChecker requires an OutputSpec")
+
+        input_satisfied = getattr(outputs, INPUT_FEASIBILITY_ATTR, None)
+        if not isinstance(input_satisfied, torch.Tensor):
+            raise RuntimeError(
+                "PropertyChecker requires lane-aware input feasibility metadata "
+                "from VerifiableModel.forward"
+            )
+        input_satisfied = input_satisfied.to(
+            device=outputs.device, dtype=torch.bool
+        ).reshape(-1)
+        if input_satisfied.shape != (inputs.shape[0],):
+            raise RuntimeError(
+                "Input feasibility mask must have shape "
+                f"({inputs.shape[0]},), got {tuple(input_satisfied.shape)}"
+            )
         
-        handler = self._dispatch.get(self.spec.kind)
-        if handler is None:
-            return (torch.zeros(B, dtype=torch.bool, device=device), [])
-        
-        # Pre-compute label tensors (used by all check methods)
-        y_true = seeds.label.to(device)
-        valid_mask = (y_true >= 0)
-        
-        return handler(inputs, outputs, y_true, valid_mask, seeds=seeds)
+        violations_mask, severity = self.spec.violation(
+            outputs, rows=seeds.original_index
+        )
+        rejected_mask = violations_mask & ~input_satisfied
+        rejected_count = int(rejected_mask.sum().item())
+        if rejected_count:
+            self.infeasible_candidates += rejected_count
+            print(
+                "⚠️  [PropertyChecker] Rejected "
+                f"{rejected_count} infeasible counterexample candidate(s) "
+                f"(total: {self.infeasible_candidates})"
+            )
+        violations_mask = violations_mask & input_satisfied
+        return self._build_results(
+            inputs, outputs, violations_mask, severity, seeds=seeds
+        )
+    
+    def _label_targets(self) -> Optional[torch.Tensor]:
+        """Flattened y_true labels, or None when the spec kind carries no label."""
+        assert self.spec is not None
+        if self.spec.kind not in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST):
+            return None
+        if self.spec.y_true is None:
+            raise ValueError(f"{self.spec.kind} requires an OutputSpec with y_true")
+        return self.spec.y_true.reshape(-1)
     
     def _build_results(
         self,
         inputs: torch.Tensor,
         outputs: torch.Tensor,
         violations_mask: torch.Tensor,
-        kind: str,
-        actual_values: torch.Tensor,
-        confidence_values: torch.Tensor,
+        severity: torch.Tensor,
         seeds: 'FuzzingSeed',
     ) -> Tuple[torch.Tensor, List[Counterexample]]:
         """Build Counterexample list from violation mask and return (mask, list)."""
+        assert self.spec is not None
         timestamp = time.time()
         violation_indices = violations_mask.nonzero(as_tuple=True)[0]
+        targets = self._label_targets()
         
         counterexamples: List[Counterexample] = []
         
         for idx in violation_indices:
-            i = idx.item()
+            i = int(idx.item())
+            spec_row = int(seeds.original_index[i].item())
+            true_class: Optional[int] = None
+            if targets is not None:
+                # y_true is either shared across rows ([1]) or one label per row ([N]).
+                target_index = 0 if targets.numel() == 1 else spec_row
+                true_class = int(targets[target_index].item())
             counterexamples.append(Counterexample(
                 input=inputs[i].detach().cpu(),
                 output=outputs[i].detach().cpu(),
-                expected=int(seeds.label[i].item()),
-                actual=int(actual_values[i].item()),
-                kind=kind,
-                confidence=float(confidence_values[i].item()),
-                timestamp=timestamp,
-                seed_index=int(seeds.original_index[i].item()),
                 seed_input=seeds.original_tensor[i].detach().cpu(),
+                kind=self.spec.kind,
+                spec_row=spec_row,
+                severity=float(severity[i].item()),
+                timestamp=timestamp,
+                true_class=true_class,
             ))
         
         return violations_mask, counterexamples
-    
-    def _check_top1(
-        self,
-        inputs: torch.Tensor,
-        outputs: torch.Tensor,
-        y_true: torch.Tensor,
-        valid_mask: torch.Tensor,
-        seeds: 'FuzzingSeed' = None,
-    ) -> Tuple[torch.Tensor, List[Counterexample]]:
-        """Check if top prediction != y_true for B samples."""
-        pred_classes = outputs.argmax(dim=1)
-        violations_mask = valid_mask & (pred_classes != y_true)
-        
-        probs = torch.softmax(outputs, dim=1)
-        confidences = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
-        
-        return self._build_results(
-            inputs, outputs, violations_mask, "TOP1_ROBUST",
-            pred_classes, confidences, seeds=seeds)
-    
-    def _check_margin(
-        self,
-        inputs: torch.Tensor,
-        outputs: torch.Tensor,
-        y_true: torch.Tensor,
-        valid_mask: torch.Tensor,
-        **kw,
-    ) -> Tuple[torch.Tensor, List[Counterexample]]:
-        """Check if margin(y_true) < threshold for B samples."""
-        B = inputs.shape[0]
-        device = outputs.device
-        num_classes = outputs.shape[1]
-        y_safe = y_true.clamp(min=0)
-        
-        true_logits = outputs.gather(1, y_safe.unsqueeze(1)).squeeze(1)
-        
-        mask = torch.ones(B, num_classes, dtype=torch.bool, device=device)
-        mask.scatter_(1, y_safe.unsqueeze(1), False)
-        runner_up_logits = outputs.masked_fill(~mask, float('-inf')).max(dim=1).values
-        
-        margins = true_logits - runner_up_logits
-        threshold = getattr(self.spec, 'margin', None)
-        if threshold is None:
-            threshold = 0.0
-        elif torch.is_tensor(threshold):
-            threshold = threshold.to(device)
-        violations_mask = valid_mask & (margins < threshold)
-        
-        actual = torch.full((B,), -1, dtype=torch.long, device=device)
-        return self._build_results(
-            inputs, outputs, violations_mask, "MARGIN_ROBUST",
-            actual, margins, **kw)
-    
-    def _check_range(
-        self,
-        inputs: torch.Tensor,
-        outputs: torch.Tensor,
-        y_true: torch.Tensor,
-        valid_mask: torch.Tensor,
-        **kw,
-    ) -> Tuple[torch.Tensor, List[Counterexample]]:
-        """Check if outputs are outside [lb, ub] bounds for B samples."""
-        B = inputs.shape[0]
-        device = outputs.device
-        
-        if self.spec.lb is None or self.spec.ub is None:
-            return (torch.zeros(B, dtype=torch.bool, device=device), [])
-        
-        lb = self._to_tensor(self.spec.lb, device)
-        ub = self._to_tensor(self.spec.ub, device)
-        
-        violations_mask = ((outputs < lb) | (outputs > ub)).any(dim=1)
-        
-        lb_viol = (lb - outputs).clamp(min=0).max(dim=1).values
-        ub_viol = (outputs - ub).clamp(min=0).max(dim=1).values
-        confidences = torch.maximum(lb_viol, ub_viol)
-        
-        actual = torch.full((B,), -1, dtype=torch.long, device=device)
-        return self._build_results(
-            inputs, outputs, violations_mask, "RANGE",
-            actual, confidences, **kw)
-    
-    def _check_linear(
-        self,
-        inputs: torch.Tensor,
-        outputs: torch.Tensor,
-        y_true: torch.Tensor,
-        valid_mask: torch.Tensor,
-        **kw,
-    ) -> Tuple[torch.Tensor, List[Counterexample]]:
-        """Check if linear constraint c^T y <= d is violated for B samples."""
-        B = inputs.shape[0]
-        device = outputs.device
-        
-        if self.spec.c is None or self.spec.d is None:
-            return (torch.zeros(B, dtype=torch.bool, device=device), [])
-        
-        c = self.spec.c.to(device)
-        d = float(self.spec.d)
-        
-        values = (outputs * c).sum(dim=1)
-        violations_mask = (values > d)
-        confidences = values - d
-        
-        actual = torch.full((B,), -1, dtype=torch.long, device=device)
-        return self._build_results(
-            inputs, outputs, violations_mask, "LINEAR_LE",
-            actual, confidences, **kw)
-    
-    @staticmethod
-    def _to_tensor(val, device: torch.device) -> torch.Tensor:
-        """Convert value to tensor on device."""
-        if isinstance(val, torch.Tensor):
-            return val.to(device)
-        return torch.tensor(val, device=device)

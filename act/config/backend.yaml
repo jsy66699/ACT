@@ -120,13 +120,71 @@ backend:
     max_nodes: 10
     frontier_cap: 0
     input_split_fanout: 2
+    # -- Branching: which over-approximated activation (or input axis) to split
+    #
+    #   branching_method  | selects            | score                          | needs dual tier
+    #   ------------------|--------------------|--------------------------------|----------------
+    #   random            | input axis         | uniform over eligible dims     | no
+    #   width             | input axis         | widest current domain          | no
+    #   babsr             | unstable ReLU      | area x |nu| (Bunel 1909.06588) | yes
+    #   fsb               | unstable ReLU      | babsr shortlist, then filtered | yes
+    #                     |                    | by a real dual solve per cand. |
+    #   gain              | unstable ReLU      | measured child bounds; falls   | yes
+    #                     |                    | back to babsr when unavailable |
+    #   witness_residual  | unstable ReLU      | relaxation gap realised at the | yes
+    #                     |                    | dual solver's spurious CE      |
+    #
+    # "needs dual tier" = requires solver_tier dual_alpha or dual_alpha_eta;
+    # otherwise the neuron scores (nu coefficients) are not produced and the
+    # verifier falls back to input splitting.
+    # multi_split_levels below is ORTHOGONAL to this choice: it controls how
+    # many neurons are split at once, not which ones are picked.
     branching_method: "random"
-    bounding_method: "random"
-    bounding_order: "depth_lb"
+
+    # -- Pool selection: which pending subproblems the next wave expands -----
+    #
+    #   bounding             | pool class          | order function                 | selection
+    #   ---------------------|---------------------|--------------------------------|--------------
+    #   depth_bound_blend    | TopKBounding        | 0.5*norm(depth)+0.5*urgency    | deterministic
+    #   greedy               | TopKBounding        | best-first on |lb|             | deterministic
+    #   annealed             | TopKBounding        | Gumbel, cooling_rate**step     | stochastic
+    #   diverse_split_signs  | DiverseTopKBounding | order + split-sign repulsion   | deterministic
+    #   random               | RandomBounding      | uniform sampling               | stochastic
+    #   mcts                 | MCTSBounding        | depth_bound_blend, pinned      | deterministic
+    #
+    # Only annealed and random draw from an RNG, so only those two can give
+    # different verdicts run-to-run under a fixed budget. top_k below applies to
+    # the four TopKBounding-family rows.
+    # greedy and annealed are the Oliva order-leading strategies (ECOOP 2025,
+    # arXiv:2507.17453); mcts is specified in docs/design/mcts_bab.md.
+    bounding: "random"
+
+    # Cap on subproblems popped per wave, independent of the batch size.
+    # 0 = unbounded. Honoured by the four TopKBounding-family strategies above;
+    # rejected for random / mcts, which do not rank the pool by an order
+    # function. Unlike frontier_cap this discards nothing — the remainder stays
+    # pooled, so a smaller top_k only re-sorts priorities more often.
+    top_k: 0
+
+    # Cooling schedule for bounding: "annealed".
     sa_cooling_rate: 0.99
+    mcts_exploration: 1.0
+    mcts_lambda: 0.5
+    mcts_virtual_loss: 1.0
     intermediate_refine: "none"
     reuse_root_bounds: false
+
+    # Neurons split jointly per branching step; each lane fans out into all 2^k
+    # sign combinations (verdict-boundary joint splitting). 1 = single split.
+    # Requires solver_tier dual_alpha or dual_alpha_eta and a neuron-branching
+    # method (babsr / fsb / gain). The k neurons are always
+    # chosen by the BaBSR heuristic (area x |nu|), whatever branching_method is.
     multi_split_levels: 1
+
+    # Tag each subproblem with node_id + parent_id so the search tree survives
+    # the flat push/pop batching. bounding: mcts enables it anyway (it credits
+    # rewards up the ancestor chain); bounding: random raises ValueError, since
+    # that pool drops the ids on pop.
     provenance_enabled: false
 
     # -- Dual-tier selector (solver_tier != lp) ----------------------------

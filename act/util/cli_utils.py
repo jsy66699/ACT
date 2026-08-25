@@ -15,10 +15,14 @@ License: AGPLv3+
 """
 
 import argparse
+from typing import Optional
+
 import torch
 
 
-def add_device_args(parser: argparse.ArgumentParser) -> None:
+def add_device_args(
+    parser: argparse.ArgumentParser, default_dtype: Optional[str] = 'float64'
+) -> None:
     """
     Add standard device and dtype arguments to an ArgumentParser.
     
@@ -30,6 +34,9 @@ def add_device_args(parser: argparse.ArgumentParser) -> None:
     
     Args:
         parser: ArgumentParser to add arguments to
+        default_dtype: Value for ``--dtype`` when the flag is absent. Pass
+            None for a tier whose dtype default lives in its config YAML, so
+            an unset flag stays None and the YAML wins.
         
     Example:
         >>> parser = argparse.ArgumentParser()
@@ -47,9 +54,12 @@ def add_device_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dtype",
         type=str,
-        default='float64',
+        default=default_dtype,
         choices=['float32', 'float64'],
-        help="Default dtype for tensors (default: float64)"
+        help=(
+            "Default dtype for tensors "
+            f"(default: {default_dtype or 'from the tier config YAML'})"
+        ),
     )
 
 

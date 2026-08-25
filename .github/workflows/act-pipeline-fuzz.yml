@@ -45,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch onnx-simplifier tensorflow pandas numpy scipy pyyaml tqdm psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch "onnx-simplifier" "onnxsim==0.6.5" tensorflow pandas numpy scipy pyyaml tqdm psutil transformers scikit-learn
 
       - name: Cache CIFAR-100 VNNLIB benchmark
         id: cifar100-cache
@@ -92,6 +92,29 @@ jobs:
         run: |
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --fuzz --category cifar100_2024 --max-instances 2 --timeout 30 --iterations 500
+
+      - name: Run fuzzing at float64 (non-quantized CIFAR-100)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --fuzz --category cifar100_2024 --dtype float64 --max-instances 2 --timeout 30 --iterations 200
+
+      - name: Cache traffic signs VNNLIB benchmark
+        id: trafficsigns-cache
+        uses: actions/cache@v4
+        with:
+          path: data/vnnlib/traffic_signs_recognition_2023
+          key: vnnlib-traffic-signs-2023-v1
+
+      - name: Download traffic signs benchmark (binarized nets)
+        if: steps.trafficsigns-cache.outputs.cache-hit != 'true'
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --download traffic_signs_recognition_2023
+
+      - name: Run fuzzing at float64 (binarized traffic signs, sign-STE path)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --fuzz --category traffic_signs_recognition_2023 --dtype float64 --max-instances 2 --timeout 30 --iterations 200
 
       - name: Run fuzzing with --category flag (safeNLP text benchmark, real FC+ReLU)
         run: |

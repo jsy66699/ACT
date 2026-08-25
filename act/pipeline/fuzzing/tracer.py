@@ -153,7 +153,7 @@ class ExecutionTracer:
             iteration: Iteration number
             timestamp: Unix timestamp
             mutation_strategy: Strategy used ("gradient", "activation", etc.)
-            violation: Counterexample if found, None otherwise
+            violation: Counterexample with spec row and severity if found, None otherwise
             coverage: Current neuron coverage (0.0-1.0)
             coverage_delta: Coverage increase this iteration
             energy: Seed energy value
@@ -203,16 +203,21 @@ class ExecutionTracer:
             Dictionary with level-appropriate fields
         """
         # Level 0: Always include basic metrics
+        violation = kwargs["violation"]
         trace = {
             "iteration": kwargs["iteration"],
             "timestamp": kwargs["timestamp"],
             "mutation_strategy": kwargs["mutation_strategy"],
-            "violation_found": kwargs["violation"] is not None,
+            "violation_found": violation is not None,
             "coverage": kwargs["coverage"],
             "coverage_delta": kwargs["coverage_delta"],
             "energy": kwargs["energy"],
             "seed_id": kwargs["seed_id"],
         }
+        if violation is not None:
+            trace["violation_kind"] = violation.kind
+            trace["violation_spec_row"] = violation.spec_row
+            trace["violation_severity"] = violation.severity
 
         # Level 1+: Add input tensors and genealogy
         if self.level >= 1:
