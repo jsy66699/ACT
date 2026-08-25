@@ -72,7 +72,8 @@ class VNNLibSpecCreator(BaseSpecCreator):
         self,
         categories: Optional[List[str]] = None,
         max_instances: Optional[int] = None,
-        validate_shapes: bool = True
+        validate_shapes: bool = True,
+        instance_indices: Optional[List[int]] = None
     ) -> List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]:
         """
         Create specs for VNNLIB benchmark instances.
@@ -88,9 +89,22 @@ class VNNLibSpecCreator(BaseSpecCreator):
         
         Args:
             categories: List of benchmark categories (None = all downloaded)
-            max_instances: Maximum instances per category (None = all)
+            max_instances: Maximum instances per category (None = all). Ignored
+                when instance_indices is given.
             validate_shapes: Whether to validate specs against model
-            
+            instance_indices: 0-based row indices into the (category-filtered)
+                instances.csv-ordered list to load, instead of a "first
+                max_instances" prefix -- e.g. instance_indices=[199] converts
+                and parses ONLY row 199, not rows 0..199. This is what lets a
+                caller that wants exactly one specific instance (e.g.
+                pattern_search_pgd.load_instance_for_attack's --instance-index)
+                avoid redundantly loading/ONNX-converting every earlier row
+                just to reach it. Order of the returned results follows
+                instance_indices' own order, not row order. Raises ValueError
+                for any index out of range for the filtered category list (a
+                caller wanting the old "skip silently" behavior should filter
+                first).
+
         Returns:
             List of tuples:
             - data_source: Category name
@@ -108,7 +122,8 @@ class VNNLibSpecCreator(BaseSpecCreator):
         """
         logger.info(
             f"Creating VNNLIB specs: categories={categories}, "
-            f"max_instances={max_instances}"
+            f"max_instances={max_instances}, "
+            f"instance_indices={instance_indices}"
         )
         
         # Get all downloaded instances
@@ -130,8 +145,22 @@ class VNNLibSpecCreator(BaseSpecCreator):
             logger.warning("No instances match the specified categories")
             return []
         
+        # Explicit row selection wins over the "first max_instances" prefix:
+        # picking rows directly is what lets a caller reach one deep instance
+        # without ONNX-converting every earlier row to get there.
+        if instance_indices is not None:
+            selected = []
+            for idx in instance_indices:
+                if not (0 <= idx < len(all_instances)):
+                    raise ValueError(
+                        f"instance index {idx} is out of range for "
+                        f"{len(all_instances)} instance(s) matching "
+                        f"categories={categories!r}."
+                    )
+                selected.append(all_instances[idx])
+            all_instances = selected
         # Limit instances per category if specified
-        if max_instances is not None:
+        elif max_instances is not None:
             # Group by category and limit each
             category_instances = {}
             for inst in all_instances:

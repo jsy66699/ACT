@@ -72,10 +72,15 @@ License: AGPLv3+
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, TYPE_CHECKING
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+
+# HPGD-Cov optimizes CoverageTracker's OWN neuron space, so it has to reduce
+# activations to a neuron matrix exactly the way the tracker does.
+from act.pipeline.fuzzing.coverage import _activation_to_neuron_matrix
 
 from act.front_end.specs import InputSpec, InKind, OutKind, OutputSpec
 from act.front_end.verifiable_model import VerifiableModel
@@ -694,6 +699,304 @@ class HPGDMutation(MutationStrategy):
         return x.detach()
 
 
+class HPGDCoverageMutation(MutationStrategy):
+    """
+    HPGD-Cov (coverage-targeted hinge-loss PGD): pushes each sample toward
+    firing one or more of its own randomly-drawn never-activated neurons,
+    using the same hinge-loss sign-gradient-descent machinery as
+    HPGDMutation/HPGDPullbackMutation, but with a coverage-native objective
+    instead of a ReLU-sign-flip or CE-margin attack objective.
+
+    Why this is a SEPARATE class from HPGDMutation rather than a mode flag:
+    HPGDMutation's neuron space is ReLU PRE-activations only (hooks
+    nn.ReLU's INPUT via a forward_pre_hook -- i.e. whatever feeds the
+    following ReLU, POST-BatchNorm for a Conv-BN-ReLU block). CoverageTracker
+    (act.pipeline.fuzzing.coverage.GlobalCov) instead hooks nn.Conv2d /
+    nn.Linear / nn.ReLU OUTPUTS directly (forward_hook, PRE-BatchNorm for a
+    Conv-BN-ReLU block) and reduces Conv2d channels via abs-max-pool over
+    spatial dims (act.pipeline.fuzzing.coverage._activation_to_neuron_matrix).
+    For a ResNet these are two DIFFERENT tensors for "the same" logical
+    neuron (BatchNorm sits in between), at two different granularities
+    (per-element vs per-channel) -- so a coverage-targeted mutation has to
+    walk CoverageTracker's OWN neuron space directly (same hook set, same
+    reduction) to actually optimize the exact quantity "never-activated
+    neuron" reporting measures, rather than a correlated-but-inexact
+    ReLU-sign proxy.
+
+    Requires `coverage_tracker` (a CoverageTracker using the "GlobalCov"
+    strategy -- get_uncovered_neurons() is only implemented by GlobalCov) to
+    be set before mutate() is called; MutationEngine wires this
+    automatically when "hpgd_cov" is a configured strategy. With no
+    uncovered neurons left (fully covered) or no coverage_tracker set,
+    falls back to plain Gaussian-noise exploration (matching RandomMutation).
+    """
+
+    def __init__(
+        self,
+        perturb_size: Union[float, torch.Tensor] = 8 / 255,
+        target_count: int = 3,
+        num_steps: int = 10,
+        step_size: Optional[float] = None,
+        margin: float = 0.1,
+        step_decay: bool = False,
+        momentum: float = 0.0,
+        nearest_margin: bool = False,
+    ):
+        """
+        Args:
+            perturb_size: L_infinity radius of the local feasible box around the seed
+            target_count: Number of never-activated neurons each sample chases per call
+                (drawn independently per sample, so a B-sample batch explores up to
+                B*target_count distinct uncovered neurons in one iteration). Ignored
+                when nearest_margin=True (always exactly 1 target/sample then).
+            num_steps: Number of hinge-loss sign-gradient steps
+            step_size: Per-step size (if None, derived from the feasible box range / steps)
+            margin: Hinge-loss target -- a neuron counts as "fired" once |activation|
+                clears this margin. Should match CoverageTracker's own firing threshold
+                (activation_threshold) so this actually optimizes the coverage-firing
+                condition, not a different one.
+            step_decay: halve step_size at Auto-PGD's checkpoint fractions
+                (0.22, 0.41, 0.60, 0.75, 0.88 of num_steps), same convention as
+                HPGDMutation/HPGDPullbackMutation.
+            momentum: 0 (default) = plain sign(grad) each step. >0 (e.g. 0.75)
+                accumulates a running momentum buffer and steps on its sign instead,
+                same convention as HPGDMutation.
+            nearest_margin: False (default) = target_count neurons drawn UNIFORMLY AT
+                RANDOM from the whole uncovered pool, independent of whether they're
+                anywhere near reachable from this sample's current position. True =
+                for each sample, run one extra no-grad forward pass on its current
+                (unmutated) input and pick the SINGLE uncovered neuron whose current
+                |activation| is closest to `margin` from below (i.e. needs the
+                smallest push to fire) as that sample's lone target. This stays in
+                the exact same tensor space the hinge loss/CoverageTracker itself
+                measures (Conv2d/Linear/ReLU module OUTPUT, not ReLU pre-activation --
+                see the class docstring for why those differ across a BatchNorm), so
+                it's a "which uncovered neuron is easiest to flip" ranking in the
+                same units the loss below optimizes, not a proxy in a different space.
+        """
+        self.perturb_size = perturb_size
+        self.target_count = int(target_count)
+        self.num_steps = int(num_steps)
+        self.step_size = step_size
+        self.margin = float(margin)
+        self.step_decay = bool(step_decay)
+        self.momentum = float(momentum)
+        self.nearest_margin = bool(nearest_margin)
+        # Wired in by MutationEngine once both it and the CoverageTracker exist.
+        self.coverage_tracker: Optional['CoverageTracker'] = None
+        self._lb: Optional[torch.Tensor] = None
+        self._ub: Optional[torch.Tensor] = None
+        # Targets chased on the last call, per sample, for the caller's bookkeeping.
+        self.last_targets: List[List[Tuple[str, int]]] = []
+        # [B] bool -- True where every target this sample chased ended up fired.
+        self.last_all_covered: Optional[torch.Tensor] = None
+
+    def set_box(self, lb: torch.Tensor, ub: torch.Tensor) -> None:
+        """Intersect the local perturb_size box with this true input box."""
+        self._lb = lb
+        self._ub = ub
+
+    @staticmethod
+    def _hooked_forward(model, x):
+        """Fresh forward pass with grad-carrying hooks on the SAME layer types
+        (Conv2d/Linear/ReLU) and OUTPUT-side capture MutationEngine's own
+        (detached) coverage hooks use -- but WITHOUT .detach(), so gradients
+        reach x. Layer names come from model.named_modules(), matching
+        CoverageTracker's activation_map keys exactly (same model object)."""
+        captured: Dict[str, torch.Tensor] = {}
+        handles = []
+
+        def make_hook(name):
+            def hook(_module, _inputs, output):
+                if isinstance(output, torch.Tensor):
+                    captured[name] = output
+            return hook
+
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.ReLU, nn.Linear, nn.Conv2d)):
+                handles.append(module.register_forward_hook(make_hook(name)))
+        try:
+            model(x)
+        finally:
+            for handle in handles:
+                handle.remove()
+        return captured
+
+    def _nearest_margin_targets(self, x0, model, uncovered_list):
+        """For each sample in x0, pick the single uncovered neuron whose CURRENT
+        |activation| (at x0, before any mutation) is closest to `margin` from
+        below -- i.e. needs the smallest push to fire. One extra no-grad forward
+        pass on the unmutated seed; ranking stays in CoverageTracker's own
+        output-hooked tensor space (see nearest_margin's docstring above)."""
+        B = x0.shape[0]
+        device = x0.device
+
+        uncovered_by_layer: Dict[str, List[int]] = {}
+        for layer_name, idx in uncovered_list:
+            uncovered_by_layer.setdefault(layer_name, []).append(idx)
+
+        with torch.no_grad():
+            captured0 = self._hooked_forward(model, x0)
+
+        best_val = torch.full((B,), -1.0, device=device)
+        best_target: List[Optional[Tuple[str, int]]] = [None] * B
+
+        for layer_name, indices in uncovered_by_layer.items():
+            raw = captured0.get(layer_name)
+            if raw is None:
+                continue
+            mat = _activation_to_neuron_matrix(raw)
+            idx_tensor = torch.tensor(indices, device=mat.device).clamp(max=mat.shape[1] - 1)
+            vals = mat[:, idx_tensor].abs()
+            layer_best_val, layer_best_pos = vals.max(dim=1)
+            # Highest |activation| among the still-uncovered = closest to firing.
+            improved = (layer_best_val > best_val).tolist()
+            layer_best_val_list = layer_best_val.tolist()
+            layer_best_pos_list = layer_best_pos.tolist()
+            for b, did_improve in enumerate(improved):
+                if not did_improve:
+                    continue
+                best_val[b] = layer_best_val_list[b]
+                best_target[b] = (layer_name, indices[layer_best_pos_list[b]])
+
+        # A sample whose every uncovered neuron sat in a layer this forward pass
+        # never produced still needs a target; give it a random one.
+        fallback = uncovered_list[torch.randint(len(uncovered_list), (1,)).item()]
+        return [[t] if t is not None else [fallback] for t in best_target]
+
+    def mutate(self, input_tensor, model, activations=None, rows=None):
+        """Apply HPGD-Cov mutation.
+
+        Args:
+            input_tensor: Seed input tensor [B, ...]
+            model: Model for gradient computation
+            activations: Unused (this strategy runs its own fresh, grad-carrying
+                forward pass instead of reusing MutationEngine's detached snapshot)
+            rows: Unused -- coverage-driven, not property-driven
+
+        Returns:
+            Mutated input tensor [B, ...], moved toward each sample's own
+            randomly-drawn never-activated neuron target(s).
+        """
+        x0 = input_tensor.detach()
+        B = x0.shape[0]
+        device = x0.device
+
+        uncovered = set()
+        if self.coverage_tracker is not None:
+            try:
+                uncovered = self.coverage_tracker.get_uncovered_neurons()
+            except NotImplementedError:
+                # Only GlobalCov implements it; any other strategy = no targets.
+                uncovered = set()
+
+        perturb_size = (
+            self.perturb_size.to(device) if isinstance(self.perturb_size, torch.Tensor)
+            else self.perturb_size
+        )
+
+        if not uncovered:
+            # Fully covered, or no tracker wired in: degrade to RandomMutation.
+            self.last_targets = [[] for _ in range(B)]
+            self.last_all_covered = torch.zeros(B, dtype=torch.bool, device=device)
+            return x0 + torch.randn_like(x0) * perturb_size
+
+        uncovered_list = list(uncovered)
+        if self.nearest_margin:
+            per_sample_targets = self._nearest_margin_targets(x0, model, uncovered_list)
+        else:
+            k = min(self.target_count, len(uncovered_list))
+            per_sample_targets = [
+                [uncovered_list[i] for i in torch.randperm(len(uncovered_list))[:k].tolist()]
+                for _ in range(B)
+            ]
+        self.last_targets = per_sample_targets
+
+        # Invert to layer -> [(sample, neuron)], so each layer's activation
+        # matrix is fetched and indexed once per step rather than per target.
+        by_layer: Dict[str, List[Tuple[int, int]]] = {}
+        for b, targets in enumerate(per_sample_targets):
+            for layer_name, idx in targets:
+                by_layer.setdefault(layer_name, []).append((b, idx))
+
+        x_low = x0 - perturb_size
+        x_high = x0 + perturb_size
+        if self._lb is not None:
+            x_low = torch.max(x_low, self._lb.to(device))
+            x_high = torch.min(x_high, self._ub.to(device))
+
+        if self.step_size is None:
+            step_size = float((x_high - x_low).abs().max().item()) / max(self.num_steps, 1)
+            step_size = max(step_size, 1e-6)
+        else:
+            step_size = float(self.step_size)
+
+        x_adv = torch.max(torch.min(x0.clone(), x_high), x_low).detach()
+
+        # Best-point tracking: the last step is not necessarily the best one.
+        best_loss = torch.full((B,), float("inf"), device=device)
+        x_best = x_adv.clone()
+        broadcast_shape = (B,) + (1,) * (x0.dim() - 1)
+
+        checkpoints = (
+            {max(1, round(self.num_steps * f)) for f in (0.22, 0.41, 0.60, 0.75, 0.88)}
+            if self.step_decay else set()
+        )
+
+        momentum_buf = None
+        sample_loss = torch.zeros(B, device=device)
+
+        for step in range(self.num_steps):
+            x_adv.requires_grad_(True)
+            captured = self._hooked_forward(model, x_adv)
+
+            sample_loss = torch.zeros(B, device=x_adv.device)
+            terms = 0
+            for layer_name, pairs in by_layer.items():
+                raw = captured.get(layer_name)
+                if raw is None:
+                    continue
+                mat = _activation_to_neuron_matrix(raw)
+                sample_idx = torch.tensor([p[0] for p in pairs], device=mat.device)
+                neuron_idx = torch.tensor([p[1] for p in pairs], device=mat.device).clamp(
+                    max=mat.shape[1] - 1
+                )
+                vals = mat[sample_idx, neuron_idx]
+                # Hinge: a target still costs until |activation| clears the margin.
+                hinge = F.relu(self.margin - vals.abs())
+                sample_loss = sample_loss.index_add(0, sample_idx, hinge)
+                terms += len(pairs)
+
+            improved = sample_loss.detach() < best_loss
+            if improved.any():
+                x_best = torch.where(improved.view(*broadcast_shape), x_adv.detach(), x_best)
+                best_loss = torch.where(improved, sample_loss.detach(), best_loss)
+
+            loss = sample_loss.sum()
+            # Nothing to optimize, no gradient path, or every target already fired.
+            if terms == 0 or not loss.requires_grad or bool((sample_loss <= 0).all().item()):
+                break
+
+            grad = torch.autograd.grad(
+                loss, x_adv, retain_graph=False, create_graph=False
+            )[0].detach()
+            direction = grad
+            if self.momentum > 0:
+                momentum_buf = (
+                    direction if momentum_buf is None
+                    else self.momentum * momentum_buf + direction
+                )
+                direction = momentum_buf
+
+            x_adv = (x_adv.detach() - step_size * torch.sign(direction)).detach()
+            x_adv = torch.max(torch.min(x_adv, x_high), x_low).detach()
+            if self.step_decay and (step + 1) in checkpoints:
+                step_size = step_size / 2.0
+
+        self.last_all_covered = best_loss <= 0
+        return x_best.detach()
+
+
 class HPGDPullbackMutation(MutationStrategy):
     """
     HPGD pull-back: the GCE (generate-counterexample) counterpart to
@@ -983,6 +1286,10 @@ class MutationEngine:
             # loss on ReLU sign patterns, not the property-violation severity
             # the gradient strategies now ascend.
             "hpgd": HPGDMutation(perturb_size=perturb_size),
+            # coverage_tracker (required) and margin (should match
+            # activation_threshold) are wired in by ACTFuzzer.__init__ after
+            # both MutationEngine and CoverageTracker are constructed.
+            "hpgd_cov": HPGDCoverageMutation(perturb_size=perturb_size),
             "activation": ActivationMutation(perturb_size=perturb_size),
             "boundary": BoundaryMutation(perturb_size=perturb_size),
             "random": RandomMutation(perturb_size=perturb_size),

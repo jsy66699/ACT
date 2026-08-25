@@ -136,11 +136,54 @@ class FuzzingConfig:
     hpgd_flip_count: int = 10
     hpgd_num_steps: int = 10
     hpgd_margin: float = 0.01
+    # Flip the target neurons one at a time (each step re-reads the pattern
+    # actually reached) instead of committing to all hpgd_flip_count flips up front.
+    hpgd_sequential_flip: bool = False
+    # Which neurons the hinge loss sums over: "target_only" scores just the
+    # flipped targets; other scopes also penalize drift in the untouched ones.
+    hpgd_loss_scope: str = "target_only"
+    # >0 steps on a running momentum buffer's sign instead of the raw gradient's.
+    hpgd_momentum: float = 0.0
+    # Halve step_size at Auto-PGD's checkpoint fractions.
+    hpgd_step_decay: bool = False
+    # Down-weights the "hold still" neurons (those whose target equals their
+    # natural sign) relative to the ones being actively flipped. 1.0 = equal.
+    hpgd_hold_still_weight: float = 1.0
+    # Normalize each neuron's hinge term by its activation scale, so neurons
+    # with large pre-activations don't dominate the summed loss.
+    hpgd_normalize_by_scale: bool = False
+    # HPGD-Cov (the "hpgd_cov" strategy) tuning: coverage-targeted, each sample
+    # chases its own randomly-drawn never-activated neurons.
+    hpgd_cov_target_count: int = 3
+    hpgd_cov_num_steps: int = 10
+    hpgd_cov_momentum: float = 0.0
+    hpgd_cov_step_decay: bool = False
+    # Chase the single uncovered neuron closest to the firing threshold from
+    # below (easiest to flip) instead of hpgd_cov_target_count random ones.
+    hpgd_cov_nearest_margin: bool = False
     # GCE (HPGDPullbackMutation) tuning.
     gce_num_steps: int = 10
     gce_margin: float = 0.01
     gce_hamming_radius: int = 3
     gce_noise_scale: float = 0.05
+    gce_step_decay: bool = False
+
+    # -- BI (broad, sparsity-guided explore) phase --
+    # None = BI runs MutationEngine's weighted portfolio. A strategy name here
+    # makes _fuzz_iteration dispatch to that attack ALONE, independent of
+    # enable_bi_gce/admission_mode/scheduling_mode.
+    bi_attack_strategy: Optional[str] = None
+    bi_attack_pgd_steps: int = 50
+    bi_attack_apgd_t_target_classes: int = 5
+    # Probability of restarting a BI batch from fresh random points in the box
+    # rather than from corpus seeds; multiplied by the cooling rate each time
+    # it fires, so restarts thin out as the run progresses. 0 = never.
+    bi_random_restart_prob: float = 0.0
+    bi_random_restart_cooling_rate: float = 0.98
+    # Run BI's HPGD and PGD stages as a producer/consumer thread pair (see
+    # act/pipeline/fuzzing/bi_threads.py) instead of sequentially.
+    bi_threaded: bool = False
+    bi_queue_size: int = 64
 
     # Tensor dtype for the pipeline tier. See act/config/pipeline.yaml for why
     # this deliberately differs from the back_end tier.
@@ -352,6 +395,21 @@ class ACTFuzzer:
             threshold=self.config.activation_threshold,
             strategy=self.config.coverage_strategy,
         )
+
+        # HPGD-Cov optimizes the tracker's own neuron space, so it can only be
+        # built once the tracker exists. Its margin is pinned to the tracker's
+        # firing threshold: a different value would optimize a different
+        # condition than the one coverage reporting measures.
+        _hpgd_cov = self.mutation_engine.strategies.get("hpgd_cov")
+        if _hpgd_cov is not None:
+            _hpgd_cov.coverage_tracker = self.coverage_tracker
+            _hpgd_cov.margin = float(self.config.activation_threshold)
+            _hpgd_cov.target_count = int(self.config.hpgd_cov_target_count)
+            _hpgd_cov.num_steps = int(self.config.hpgd_cov_num_steps)
+            _hpgd_cov.momentum = float(self.config.hpgd_cov_momentum)
+            _hpgd_cov.step_decay = bool(self.config.hpgd_cov_step_decay)
+            _hpgd_cov.nearest_margin = bool(self.config.hpgd_cov_nearest_margin)
+
         self.property_checker = PropertyChecker(self.output_spec)
         self.seed_corpus = SeedCorpus(
             initial_seeds=initial_seeds, strategy=self.config.seed_selection_strategy
