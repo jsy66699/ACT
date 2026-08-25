@@ -428,6 +428,15 @@ def main() -> None:
              "single uncovered neuron closest to activation_threshold from below "
              "(easiest to flip) per sample. See FuzzingConfig.hpgd_cov_nearest_margin.",
     )
+    parser.add_argument(
+        "--repeat", type=int, default=1,
+        help="Run this many independent trials in ONE process, writing each to "
+             "<output>/rep<N>/. The VNNLIB load and model synthesis are paid "
+             "once instead of per trial -- on cifar100_2024 that setup is 109s "
+             "against 120s of fuzzing, so per-trial re-invocation spends nearly "
+             "half a campaign re-reading the same ONNX files. Each repeat still "
+             "builds a fresh ACTFuzzer, so corpus/coverage/state start empty.",
+    )
     parser.add_argument("--report-interval", type=int, default=2000)
     parser.add_argument("--verbose", type=int, default=1)
     parser.add_argument("--no-save", action="store_false", dest="save_counterexamples")
@@ -477,29 +486,40 @@ def main() -> None:
         raise RuntimeError("ACT model synthesis produced no wrapped models.")
     print(f"[paper_cifar100_batch_ani] Got G={len(wrapped_models)} model group(s)")
 
-    group_results: list[GroupResult] = []
-    for model_id, wrapped_model in wrapped_models.items():
-        safe_name = "_".join(map(str, model_id)) if isinstance(model_id, tuple) else str(model_id)
-        group_dir = output_dir / safe_name.replace("/", "_").replace("\\", "_")
-        group_results.append(run_group(model_id, wrapped_model, args, group_dir))
+    # --repeat runs the trials inside one process so the ONNX load and model
+    # synthesis above are paid once instead of per trial. On cifar100_2024 that
+    # setup is 109s against 120s of actual fuzzing, so re-invoking the module
+    # per trial spends nearly half the campaign re-reading the same files.
+    # Each repeat still builds a fresh ACTFuzzer (and so a fresh corpus,
+    # coverage tracker and state manager) inside run_group, so trials stay
+    # independent; only the immutable loaded models are shared.
+    for rep in range(1, args.repeat + 1):
+        rep_dir = output_dir if args.repeat == 1 else output_dir / f"rep{rep}"
+        if args.repeat > 1:
+            print(f"\n{'#' * 78}\n# repeat {rep}/{args.repeat}\n{'#' * 78}")
+        group_results: list[GroupResult] = []
+        for model_id, wrapped_model in wrapped_models.items():
+            safe_name = "_".join(map(str, model_id)) if isinstance(model_id, tuple) else str(model_id)
+            group_dir = rep_dir / safe_name.replace("/", "_").replace("\\", "_")
+            group_results.append(run_group(model_id, wrapped_model, args, group_dir))
 
-    print_table4_row(args.category, group_results)
+        print_table4_row(args.category, group_results)
 
-    with open(output_dir / "table4_summary.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "benchmark": args.category,
-                "method": "Batch-Ani",
-                "perturb_scale": args.perturb_scale,
-                "timeout_per_group_seconds": args.timeout,
-                "groups": [g.__dict__ for g in group_results],
-                "total_violations": sum(g.violations for g in group_results),
-            },
-            f,
-            indent=2,
-        )
-    print(f"\n[paper_cifar100_batch_ani] Full summary written to "
-          f"{output_dir / 'table4_summary.json'}")
+        with open(rep_dir / "table4_summary.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "benchmark": args.category,
+                    "method": "Batch-Ani",
+                    "perturb_scale": args.perturb_scale,
+                    "timeout_per_group_seconds": args.timeout,
+                    "groups": [g.__dict__ for g in group_results],
+                    "total_violations": sum(g.violations for g in group_results),
+                },
+                f,
+                indent=2,
+            )
+        print(f"\n[paper_cifar100_batch_ani] Full summary written to "
+              f"{rep_dir / 'table4_summary.json'}")
 
 
 if __name__ == "__main__":
