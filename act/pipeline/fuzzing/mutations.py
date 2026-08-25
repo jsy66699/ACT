@@ -790,6 +790,15 @@ class HPGDCoverageMutation(MutationStrategy):
         self.last_targets: List[List[Tuple[str, int]]] = []
         # [B] bool -- True where every target this sample chased ended up fired.
         self.last_all_covered: Optional[torch.Tensor] = None
+        # Why the last call degraded to Gaussian noise instead of chasing a
+        # target, or None if it actually ran. Without this the strategy is
+        # indistinguishable from RandomMutation from the outside, which is how
+        # a fully-saturated benchmark silently turned a whole experiment arm
+        # into "extra random noise" -- see fallback_counts.
+        self.last_fallback_reason: Optional[str] = None
+        self.fallback_counts: Dict[str, int] = {
+            "no_tracker": 0, "not_yet_observed": 0, "fully_covered": 0, "ran": 0,
+        }
 
     def set_box(self, lb: torch.Tensor, ub: torch.Tensor) -> None:
         """Intersect the local perturb_size box with this true input box."""
@@ -882,24 +891,42 @@ class HPGDCoverageMutation(MutationStrategy):
         B = x0.shape[0]
         device = x0.device
 
+        # An empty uncovered set means two opposite things -- the tracker has
+        # not observed anything yet, or everything is already covered -- and
+        # both degrade this strategy to Gaussian noise. Separate them so the
+        # reason is recorded rather than silently swallowed.
         uncovered = set()
-        if self.coverage_tracker is not None:
+        reason = None
+        if self.coverage_tracker is None:
+            reason = "no_tracker"
+        elif not self.coverage_tracker.has_observations():
+            # Pre-warmup: nothing to steer toward yet, but this is NOT the
+            # same as saturation and must not be reported as such.
+            reason = "not_yet_observed"
+        else:
             try:
                 uncovered = self.coverage_tracker.get_uncovered_neurons()
             except NotImplementedError:
                 # Only GlobalCov implements it; any other strategy = no targets.
                 uncovered = set()
+                reason = "no_tracker"
+            if not uncovered and reason is None:
+                reason = "fully_covered"
 
         perturb_size = (
             self.perturb_size.to(device) if isinstance(self.perturb_size, torch.Tensor)
             else self.perturb_size
         )
 
-        if not uncovered:
-            # Fully covered, or no tracker wired in: degrade to RandomMutation.
+        if reason is not None:
+            self.last_fallback_reason = reason
+            self.fallback_counts[reason] += 1
             self.last_targets = [[] for _ in range(B)]
             self.last_all_covered = torch.zeros(B, dtype=torch.bool, device=device)
             return x0 + torch.randn_like(x0) * perturb_size
+
+        self.last_fallback_reason = None
+        self.fallback_counts["ran"] += 1
 
         uncovered_list = list(uncovered)
         if self.nearest_margin:

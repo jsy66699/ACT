@@ -589,6 +589,28 @@ class ACTFuzzer:
         print(f"   Max iterations: {self.config.max_iterations}")
         print(f"   Timeout: {self.config.timeout_seconds}s\n")
 
+        # Warm the coverage tracker on the initial corpus before the first
+        # mutation. Without this, iteration 0 sees masks that have never been
+        # built, which get_uncovered_neurons() reports identically to full
+        # saturation -- so any coverage-steered strategy is blind on its first
+        # call. Counts toward GlobalCov (the seeds are inputs the fuzzer has
+        # genuinely executed), so coverage here is not comparable to runs from
+        # before this warmup existed.
+        with torch.no_grad():
+            _seed_batch = self.seed_corpus.select(batch_size)
+            _warm_out = self.model(_seed_batch.tensor.to(self.device))
+            del _warm_out
+            self.coverage_tracker.update(
+                _seed_batch.tensor.to(self.device),
+                self.mutation_engine.get_activation_map(),
+            )
+            _other = "BestInputCov" if self.config.coverage_strategy == "GlobalCov" else "GlobalCov"
+            self.coverage_tracker.update(
+                _seed_batch.tensor.to(self.device),
+                self.mutation_engine.get_activation_map(),
+                strategy=_other,
+            )
+
         self.start_time = time.time()
         iteration = 0
 
@@ -881,6 +903,20 @@ class ACTFuzzer:
                 [f"{ln}[{i}]" for (ln, i) in report.never_activated_neurons[:10]]
             )
             print(f"   Never-activated sample: {sample_str}")
+
+        # A saturated benchmark turns hpgd_cov into plain Gaussian noise, which
+        # is invisible in every other number here -- say so out loud rather than
+        # letting an experiment arm quietly measure something else.
+        _cov = self.mutation_engine.strategies.get("hpgd_cov")
+        if _cov is not None and sum(_cov.fallback_counts.values()) > 0:
+            fc = _cov.fallback_counts
+            total = sum(fc.values())
+            print(f"   HPGD-Cov calls: {total} "
+                  f"(ran {fc['ran']}, fully-covered {fc['fully_covered']}, "
+                  f"pre-warmup {fc['not_yet_observed']}, no-tracker {fc['no_tracker']})")
+            if fc["ran"] == 0:
+                print("   ⚠️  HPGD-Cov never steered: it ran as Gaussian noise "
+                      "for the whole run (coverage saturated?).")
         print(f"{rule()}\n")
 
         if self.config.save_counterexamples and report.counterexamples:

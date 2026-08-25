@@ -101,6 +101,11 @@ class CoverageStrategy(ABC):
     def get_covered_neurons(self) -> Set[NeuronId]:
         raise NotImplementedError
 
+    def has_observations(self) -> bool:
+        """Whether update() has ever run. Distinguishes "no masks built yet"
+        from "fully covered", which get_uncovered_neurons() reports alike."""
+        raise NotImplementedError
+
 
 def _activation_to_neuron_matrix(activation: torch.Tensor) -> torch.Tensor:
     """
@@ -199,6 +204,9 @@ class BestInputCov(CoverageStrategy):
             "total_neurons_seen": int(sum(self._layer_neuron_counts.values())),
             "layers_seen": int(len(self._layer_neuron_counts)),
         }
+
+    def has_observations(self) -> bool:
+        return self._inputs_seen > 0
 
     def reset(self) -> None:
         self._layer_neuron_counts.clear()
@@ -320,6 +328,9 @@ class GlobalCov(CoverageStrategy):
             "layers_seen": int(len(self._layer_neuron_counts)),
         }
 
+    def has_observations(self) -> bool:
+        return bool(self._covered_masks)
+
     def reset(self) -> None:
         self._covered_masks.clear()
         self._layer_neuron_counts.clear()
@@ -389,6 +400,19 @@ class CoverageTracker:
     def get_stats(self, strategy: Optional[str] = None) -> Dict[str, Any]:
         s = strategy if strategy is not None else self.strategy
         return {"strategy": s, **self._get_strategy(s).get_stats()}
+
+    def has_observations(self, strategy: Optional[str] = None) -> bool:
+        """Whether update() has ever run for this strategy.
+
+        get_uncovered_neurons() returns an empty set for BOTH "nothing has been
+        observed yet" (masks not built) and "everything is covered" -- opposite
+        situations that a caller steering on uncovered neurons must not
+        conflate. Consult this first; see HPGDCoverageMutation.mutate.
+        """
+        s = strategy if strategy is not None else self.strategy
+        if s not in self._strategies:
+            return False
+        return self._strategies[s].has_observations()
 
     def get_uncovered_neurons(self, strategy: Optional[str] = None) -> Set[NeuronId]:
         s = strategy if strategy is not None else self.strategy
