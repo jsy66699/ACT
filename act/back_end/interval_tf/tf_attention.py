@@ -461,7 +461,7 @@ class LinearBounds:
         Implements the dual-norm linear bound of the multi-head dot-product:
         one valid plane per side, summed over the head dimension.
         """
-        if self.dim_in == 1:
+        if self.dim_in == 0:
             return self._dot_product_degenerate(other)
         return self._dot_product_planes(other, z=False)
 
@@ -473,7 +473,7 @@ class LinearBounds:
         The pair is fused by :func:`fuse_attention_planes`; returning both is
         load-bearing because the catalytic ReLU acts on their difference.
         """
-        if self.dim_in == 1:
+        if self.dim_in == 0:
             degenerate = self._dot_product_degenerate(other)
             return degenerate, degenerate.clone()
         return (

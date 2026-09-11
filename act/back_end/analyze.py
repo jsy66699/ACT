@@ -16,7 +16,7 @@ import torch
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, cast
-from act.back_end.core import Bounds, Fact, Net, ConSet
+from act.back_end.core import Bounds, Fact, Net, ConSet, get_topo_order
 from act.back_end.layer_schema import LayerKind
 from act.back_end.utils import box_join, changed_or_maskdiff, update_cache
 from act.back_end.transfer_functions import (
@@ -114,7 +114,9 @@ def analyze(
         before[entry_id] = entry_fact
         seeds = [entry_id]
 
-    WL = deque(seeds)
+    tf = get_transfer_function()
+    single_pass = bool(getattr(tf, "topological_single_pass", False))
+    WL = deque(get_topo_order(net) if single_pass else seeds)
     while WL:
         lid = WL.popleft(); layer = net.by_id[lid]
 
@@ -139,7 +141,7 @@ def analyze(
             before[lid] = Fact(Bjoin, Cjoin)
 
         out_fact = dispatch_tf(layer, before, after, net)
-        side_sig = get_transfer_function().side_state_signature(layer.id)
+        side_sig = tf.side_state_signature(layer.id)
         side_changed = layer.cache.get("prev_tf_side_state") != side_sig
 
         if changed_or_maskdiff(layer, out_fact.bounds, None, eps) or side_changed:
@@ -147,6 +149,7 @@ def analyze(
             update_cache(layer, out_fact.bounds, None)
             layer.cache["prev_tf_side_state"] = side_sig
             for con in out_fact.cons: globalC.replace(con)
-            for sid in net.succs.get(lid, []): WL.append(sid)
+            if not single_pass:
+                for sid in net.succs.get(lid, []): WL.append(sid)
 
     return before, after, globalC

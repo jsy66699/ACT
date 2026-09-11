@@ -133,13 +133,27 @@ def _tf_att_scores_dual_planar(L: Layer) -> Fact:
     C.add_box(L.id, L.out_vars, B)
     return Fact(B, C)
 
+
+def softmax_rowsize(L: Layer, bounds: Bounds) -> Optional[int]:
+    input_shape = L.params.get("input_shape")
+    axis = int(L.params.get("axis", -1))
+    if input_shape is None:
+        return int(bounds.lb.shape[-1])
+    shape = tuple(int(d) for d in cast(Tuple[int, ...], input_shape))
+    axis = axis if axis >= 0 else len(shape) + axis
+    if axis == len(shape) - 1 and bounds.lb.numel() % shape[axis] == 0:
+        return int(shape[axis])
+    return None
+
+
 def tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     B=Bounds(torch.zeros_like(Bin.lb), torch.ones_like(Bin.ub))
-    rowsize=int(Bin.lb.shape[-1]); mode=L.params.get("mode","simplex"); tag=f"softmax:{mode}:{L.id}"
+    rowsize=softmax_rowsize(L, Bin); mode=L.params.get("mode","simplex"); tag=f"softmax:{mode}:{L.id}"
     C=ConSet()
-    if mode=="simplex": C.replace(Con("INEQ", tuple(L.out_vars), {"tag":tag,"rowsize":rowsize}))
-    elif mode=="pwl":  C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":tag,"rowsize":rowsize,"segs":{"K":3}}))
-    else:              C.replace(Con("BIN",  tuple(L.out_vars+L.in_vars), {"tag":tag,"rowsize":rowsize,"K":4,"sos2":True}))
+    if rowsize is not None:
+        if mode=="simplex": C.replace(Con("INEQ", tuple(L.out_vars), {"tag":tag,"rowsize":rowsize}))
+        elif mode=="pwl":  C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":tag,"rowsize":rowsize,"segs":{"K":3}}))
+        else:              C.replace(Con("BIN",  tuple(L.out_vars+L.in_vars), {"tag":tag,"rowsize":rowsize,"K":4,"sos2":True}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_att_mix(L: Layer, Bw: Bounds, Bv: Bounds) -> Fact:

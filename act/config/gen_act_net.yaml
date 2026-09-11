@@ -384,7 +384,25 @@ net_factory:
 
 
   # ============================================================================
-  # 4. INPUT SPECIFICATION  (INPUT_SPEC layer)
+  # 4. DETERMINISTIC LAYER-TESTING ARCHITECTURES
+  # ============================================================================
+  # These architectures are emitted alongside the sampled families so the
+  # manifest-driven netfactory sweep exercises them without workflow changes.
+
+  layer_testing:
+    attention:
+      batch_size: 1
+      sequence_length: 2
+      hidden_size: 2
+      input_bounds: [-0.07, 0.07]
+      projection_scale: 0.2
+      projection_seeds: [71, 72, 73]
+      layernorm_variant: no_var
+      assert_threshold: 100.0
+
+
+  # ============================================================================
+  # 5. INPUT SPECIFICATION  (INPUT_SPEC layer)
   # ============================================================================
   # Defines the input region that verification will analyze.
   # Every generated network gets exactly one INPUT_SPEC.
@@ -416,7 +434,7 @@ net_factory:
 
 
   # ============================================================================
-  # 5. OUTPUT SPECIFICATION  (ASSERT layer)
+  # 6. OUTPUT SPECIFICATION  (ASSERT layer)
   # ============================================================================
   # Defines the verification property the network output must satisfy.
   # Every generated network gets exactly one ASSERT.
@@ -459,7 +477,7 @@ net_factory:
 
 
   # ============================================================================
-  # 6. VALIDATE-VERIFIER DEFAULTS
+  # 7. VALIDATE-VERIFIER DEFAULTS
   # ============================================================================
   # Defaults consumed by `python -m act.pipeline --verify netfactory --validate-soundness ...`
   # when the corresponding CLI flag is NOT explicitly passed. Any CLI flag

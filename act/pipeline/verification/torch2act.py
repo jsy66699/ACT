@@ -1688,7 +1688,16 @@ class _LayerGraphBuilder:
         axis = getattr(mod, 'dim', None)
         if axis is None:
             axis = -1
-        self._add_layer(LayerKind.SOFTMAX.value, {"axis": int(axis)}, self.prev_out, out_vars)
+        self._add_layer(
+            LayerKind.SOFTMAX.value,
+            {
+                "axis": int(axis),
+                "input_shape": self.shape,
+                "output_shape": self.shape,
+            },
+            self.prev_out,
+            out_vars,
+        )
         self.prev_out = out_vars
 
     # -------------------------------------------------------------------------

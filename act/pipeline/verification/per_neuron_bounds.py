@@ -86,7 +86,6 @@ import torch
 
 from act.back_end.core import Bounds, Layer
 from act.back_end.layer_schema import (
-    HOOKABLE_ACTIVATION_KINDS,
     TRANSFORMER_KINDS,
     LayerKind,
 )
@@ -102,6 +101,20 @@ _ACT_KIND_TO_MODULE = {
     LayerKind.TANH.value: "Tanh",
     LayerKind.SILU.value: "SiLU",
     LayerKind.LRELU.value: "LeakyReLU",
+    LayerKind.SIN.value: "ACTSin",
+    LayerKind.COS.value: "ACTCos",
+    LayerKind.ERF.value: "ACTErf",
+    LayerKind.SQRT.value: "ACTSqrt",
+    LayerKind.QUANTIZE.value: "ACTQuantize",
+    LayerKind.ATT_SCORES.value: "ACTAttentionScores",
+    LayerKind.ATT_MIX.value: "ACTAttentionMix",
+    LayerKind.MHA_SPLIT.value: "ACTMHASplit",
+    LayerKind.MHA_JOIN.value: "ACTMHAJoin",
+    LayerKind.SOFTMAX.value: "Softmax",
+    LayerKind.LAYERNORM.value: "ACTLayerNorm",
+    LayerKind.GELU.value: "GELU",
+    LayerKind.MASK_ADD.value: "ACTMaskAdd",
+    LayerKind.MATMUL.value: "ACTMatMul",
     LayerKind.FLATTEN.value: "Flatten",
     LayerKind.MAXPOOL1D.value: "MaxPool1d",
     LayerKind.MAXPOOL2D.value: "MaxPool2d",
@@ -112,9 +125,56 @@ _ACT_KIND_TO_MODULE = {
     LayerKind.ADAPTIVEAVGPOOL2D.value: "AdaptiveAvgPool2d",
 }
 
-_PRE_ACTIVATION_MODULES = frozenset(
-    _ACT_KIND_TO_MODULE[k] for k in HOOKABLE_ACTIVATION_KINDS
+# ``DualSolver`` calls ``compute_forward_bounds(post_activation=False)``.  Its
+# nonlinear relaxation handlers therefore store the incoming (pre-activation)
+# box, while affine, shape, pooling, and bilinear handlers store their output
+# box.  Keep that distinction in ACT-layer terms: module names are only a
+# tracing detail and do not define which tensor a verifier bound represents.
+_PRE_ACTIVATION_BOUND_KINDS = frozenset(
+    {
+        LayerKind.RELU.value,
+        LayerKind.SIGMOID.value,
+        LayerKind.TANH.value,
+        LayerKind.SILU.value,
+        LayerKind.LRELU.value,
+        LayerKind.SIN.value,
+        LayerKind.COS.value,
+        LayerKind.ERF.value,
+        LayerKind.SQRT.value,
+        LayerKind.QUANTIZE.value,
+        LayerKind.SOFTMAX.value,
+        LayerKind.LAYERNORM.value,
+        LayerKind.GELU.value,
+    }
 )
+
+_POST_ACTIVATION_BOUND_KINDS = frozenset(
+    {
+        LayerKind.DENSE.value,
+        LayerKind.CONV1D.value,
+        LayerKind.CONV2D.value,
+        LayerKind.CONV3D.value,
+        LayerKind.ATT_SCORES.value,
+        LayerKind.ATT_MIX.value,
+        LayerKind.MHA_SPLIT.value,
+        LayerKind.MHA_JOIN.value,
+        LayerKind.MASK_ADD.value,
+        LayerKind.MATMUL.value,
+        LayerKind.FLATTEN.value,
+        LayerKind.MAXPOOL1D.value,
+        LayerKind.MAXPOOL2D.value,
+        LayerKind.MAXPOOL3D.value,
+        LayerKind.AVGPOOL1D.value,
+        LayerKind.AVGPOOL2D.value,
+        LayerKind.AVGPOOL3D.value,
+        LayerKind.ADAPTIVEAVGPOOL2D.value,
+    }
+)
+
+assert not (_PRE_ACTIVATION_BOUND_KINDS & _POST_ACTIVATION_BOUND_KINDS)
+assert (
+    _PRE_ACTIVATION_BOUND_KINDS | _POST_ACTIVATION_BOUND_KINDS
+) == frozenset(_ACT_KIND_TO_MODULE)
 
 
 def check_hookable_alignment(act_net, model: torch.nn.Module) -> Optional[str]:
@@ -133,6 +193,12 @@ def check_hookable_alignment(act_net, model: torch.nn.Module) -> Optional[str]:
     hookable_layers = sum(
         1 for layer in layers if _ACT_KIND_TO_MODULE.get(layer.kind) in hookable_kinds
     )
+
+    if hookable_layers == 0:
+        return (
+            "reference model and ACT net expose no 1:1 hookable layers; "
+            "per-neuron bounds were not checked"
+        )
 
     if hookable_modules == hookable_layers:
         return None
@@ -241,7 +307,7 @@ def collect_concrete_activations(
     errors: List[str] = []
     warnings: List[str] = []
     call_counts: Dict[int, int] = {}
-    hookable_events: List[Tuple[str, torch.Tensor]] = []
+    hookable_events: List[Tuple[str, Any, Any]] = []
     hooks = []
 
     def _hook(module, inputs, output):
@@ -250,11 +316,8 @@ def collect_concrete_activations(
         if strict_single_call_per_module and call_counts[module_id] > 1:
             errors.append(f"Module called multiple times: {module.__class__.__name__}")
         module_type = module.__class__.__name__
-        tensor_source = inputs[0] if pre_activation and module_type in _PRE_ACTIVATION_MODULES else output
-        if not torch.is_tensor(tensor_source):
-            warnings.append(f"Non-tensor activation from {module_type}")
-            return
-        hookable_events.append((module_type, tensor_source.detach()))
+        module_input = inputs[0] if inputs else None
+        hookable_events.append((module_type, module_input, output))
 
     hookable_kinds = set(_ACT_KIND_TO_MODULE.values())
 
@@ -314,7 +377,7 @@ def collect_concrete_activations(
     for idx, layer in enumerate(hookable_layers):
         if idx >= len(hookable_events):
             break
-        module_type, tensor = hookable_events[idx]
+        module_type, module_input, module_output = hookable_events[idx]
         expected = _ACT_KIND_TO_MODULE.get(layer.kind)
         if expected is None:
             errors.append(
@@ -324,6 +387,18 @@ def collect_concrete_activations(
             errors.append(
                 f"Kind/type mismatch at position {idx}: act_kind={layer.kind} event_type={module_type}"
             )
+        tensor_source = (
+            module_input
+            if pre_activation and layer.kind in _PRE_ACTIVATION_BOUND_KINDS
+            else module_output
+        )
+        if not torch.is_tensor(tensor_source):
+            errors.append(
+                f"Non-tensor activation at layer_id={layer.id}: "
+                f"kind={layer.kind} module={module_type}"
+            )
+            continue
+        tensor = tensor_source.detach()
         expected_shape = None
 
         params = getattr(layer, "params", {}) or {}

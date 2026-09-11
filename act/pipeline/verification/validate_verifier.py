@@ -757,7 +757,20 @@ class VerificationValidator:
                     samples_processed=sample_idx,
                 )
 
-        if violations:
+        # Never turn an empty hook trace into a green soundness result.
+        if total_checks == 0:
+            result = _bounds_record(
+                validation_status="SKIPPED",
+                explanation=(
+                    "⏭️  SKIPPED: per-neuron validation produced zero bound checks; "
+                    "no soundness claim was made"
+                ),
+                total_checks=0,
+                violations=[],
+                per_neuron_config={"topk": per_neuron_config.topk},
+            )
+            logger.info(f"\n  {result['explanation']}")
+        elif violations:
             result = _bounds_record(
                 validation_status="FAILED",
                 explanation=f"🚨 UNSOUND BOUNDS: {len(violations)} violations found across {num_samples} samples",
@@ -987,6 +1000,8 @@ class VerificationValidator:
             print(f"\n⚠️  All {validation_type} validation tests encountered errors!")
             print("This indicates pre-existing bugs in the verification backend.")
             print()
+        elif validation_type == "bounds" and summary.get("total_checks", 0) == 0:
+            print("\n⏭️  BOUNDS validation SKIPPED: no bound checks were performed.")
         else:
             print(f"\n✅ {validation_type.upper()} validation PASSED!")
 

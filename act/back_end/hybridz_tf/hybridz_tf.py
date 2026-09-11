@@ -27,7 +27,10 @@ from act.back_end.layer_schema import LayerKind
 from act.back_end.solver.solver_hz import (
     HZono,
     SparseHZono,
+    hz_bounds_are_liftable,
     hz_from_bounds,
+    hz_lift_bounds,
+    hz_tighten_bounds,
     sparse_hz_fast_bounds,
     sparse_hz_from_bounds,
 )
@@ -41,20 +44,30 @@ import act.back_end.interval_tf.tf_cnn as interval_cnn
 
 
 class HybridzTF(RegistryTF):
+    topological_single_pass = True
+
     def __init__(self, config: Optional[HybridZConfig] = None):
         super().__init__("HybridzTF")
         cfg = config or HybridZConfig()
         self._hz_cache: Dict[int, HZono] = {}
         self._sparse_hz_cache: Dict[int, SparseHZono] = {}
         self._sparse_drop_reasons: Dict[int, str] = {}
+        self._sigmoid_affine_targets: Dict[int, int] = {}
+        self._sigmoid_affine_inputs: Dict[int, HZono] = {}
+        self._softmax_differences: Dict[int, object] = {}
+        self._softmax_score_contexts: Dict[int, object] = {}
         self._cache_net_id: Optional[int] = None
         self._tanh_K: int = 2
-        self._sigmoid_K: int = 2
+        self._sigmoid_K: int = int(cfg.sigmoid_segments)
+        if self._sigmoid_K < 1:
+            raise ValueError("HybridZ sigmoid_segments must be positive")
+        self._fuse_sigmoid_affine: bool = bool(cfg.fuse_sigmoid_affine)
         self._var_id_stride: int = 1
         setattr(self, "_HZ_MAX_INPUT_DIM", cfg.max_input_dim)
         self._sparse_next_frame_id: int = 0
         self._sparse_frame_widths: Dict[int, tuple[int, int]] = {}
         self._sparse_relu_slots: Dict[tuple[int, int, int], tuple[int, int, int]] = {}
+        self._sparse_aux_slots: Dict[tuple[int, int], tuple[int, ...]] = {}
 
     @staticmethod
     def _net_var_id_stride(net: Net) -> int:
@@ -108,6 +121,7 @@ class HybridzTF(RegistryTF):
         LayerKind.SQUARE.value: lambda L, b, tf: interval_mlp.tf_square(L, b),
         LayerKind.POWER.value: lambda L, b, tf: interval_mlp.tf_power(L, b),
         LayerKind.SIGN.value: lambda L, b, tf: hz_mlp.tf_sign(L, b, tf),
+        LayerKind.MEAN.value: lambda L, b, tf: hz_mlp.tf_mean(L, b, tf),
         LayerKind.REDUCE_SUM.value: lambda L, b, tf: hz_mlp.tf_reduce_sum(L, b, tf),
         LayerKind.CONSTANT.value: lambda L, b, tf: hz_mlp.tf_constant(L, b, tf),
         LayerKind.COMPARE.value: lambda L, b, tf: hz_mlp.tf_compare(L, b, tf),
@@ -212,18 +226,50 @@ class HybridzTF(RegistryTF):
             cls._csr_sig(hz.Auc),
             cls._csr_sig(hz.Aub),
             hz.frame_id,
+            bool(hz.exact),
         )
 
     def side_state_signature(self, layer_id: int):
         lid = int(layer_id)
+        target = self._sigmoid_affine_targets.get(lid, lid)
         return (
             self._hz_sig(self._hz_cache.get(lid)),
             self._sparse_hz_sig(self._sparse_hz_cache.get(lid)),
             self._sparse_drop_reasons.get(lid),
+            self._hz_sig(self._sigmoid_affine_inputs.get(target)),
         )
 
     _HZ_MAX_INPUT_DIM = 1024
-    _SPARSE_MAX_AFFINE_CELLS = 8_000_000
+    _SPARSE_MAX_AFFINE_CELLS = 64_000_000
+
+    @staticmethod
+    def _find_sigmoid_affine_targets(net: Net) -> Dict[int, int]:
+        shape_only = {
+            LayerKind.FLATTEN.value,
+            LayerKind.RESHAPE.value,
+        }
+        targets: Dict[int, int] = {}
+        for layer in net.layers:
+            if layer.kind.upper() != LayerKind.SIGMOID.value:
+                continue
+            current = layer.id
+            chain = [current]
+            while True:
+                successors = net.succs.get(current, [])
+                if len(successors) != 1:
+                    break
+                successor = successors[0]
+                if net.preds.get(successor, []) != [current]:
+                    break
+                kind = net.by_id[successor].kind.upper()
+                if kind == LayerKind.DENSE.value:
+                    targets.update((node, successor) for node in chain)
+                    break
+                if kind not in shape_only:
+                    break
+                current = successor
+                chain.append(current)
+        return targets
 
     def _col_ids_from_vars(self, bounds: Bounds, var_ids) -> Optional[torch.Tensor]:
         if not var_ids:
@@ -301,16 +347,42 @@ class HybridzTF(RegistryTF):
         self._sparse_frame_widths[frame_id] = (n_cont, n_bin)
         return slots, n_cont, n_bin
 
+    def _sparse_cont_slots_for(
+        self,
+        hz: SparseHZono,
+        layer_id: int,
+        count: int,
+    ) -> Optional[tuple[tuple[int, ...], int]]:
+        if hz.frame_id is None:
+            raise ValueError("sparse auxiliary generators require a frame")
+        frame_id = int(hz.frame_id)
+        key = (frame_id, int(layer_id))
+        slots = self._sparse_aux_slots.get(key)
+        n_cont, n_bin = self._sparse_frame_widths.get(
+            frame_id, (hz.n_cont, hz.n_bin)
+        )
+        n_cont = max(n_cont, hz.n_cont)
+        n_bin = max(n_bin, hz.n_bin)
+        if slots is None:
+            count = int(count)
+            if count * (n_cont + n_bin + count) > self._SPARSE_MAX_AFFINE_CELLS:
+                return None
+            slots = tuple(range(n_cont, n_cont + count))
+            self._sparse_aux_slots[key] = slots
+            n_cont += count
+            self._sparse_frame_widths[frame_id] = (n_cont, n_bin)
+        elif len(slots) != int(count):
+            raise ValueError(
+                f"sparse auxiliary slot count changed for layer {layer_id}: "
+                f"{len(slots)} vs {count}"
+            )
+        return slots, n_cont
+
     @staticmethod
     def _sparse_fact(fact: Fact, hz: SparseHZono) -> Fact:
         hb = sparse_hz_fast_bounds(hz)
-        lb = hb.lb.to(dtype=fact.bounds.lb.dtype, device=fact.bounds.lb.device)
-        ub = hb.ub.to(dtype=fact.bounds.ub.dtype, device=fact.bounds.ub.device)
         return Fact(
-            bounds=Bounds(
-                lb=torch.maximum(lb.reshape_as(fact.bounds.lb), fact.bounds.lb),
-                ub=torch.minimum(ub.reshape_as(fact.bounds.ub), fact.bounds.ub),
-            ),
+            bounds=hz_tighten_bounds(fact.bounds, hb),
             cons=fact.cons,
         )
 
@@ -355,6 +427,7 @@ class HybridzTF(RegistryTF):
             for apply_sparse in (
                 hz_mlp.sparse_hz_apply_layer,
                 hz_cnn.sparse_hz_apply_layer,
+                hz_transformer.sparse_hz_apply_layer,
             ):
                 handled, out, drop_reason = apply_sparse(L, hz, input_bounds, result, self)
                 if not handled:
@@ -385,11 +458,20 @@ class HybridzTF(RegistryTF):
             self._hz_cache.clear()
             self._sparse_hz_cache.clear()
             self._sparse_drop_reasons.clear()
+            self._sigmoid_affine_inputs.clear()
+            self._softmax_differences.clear()
+            self._softmax_score_contexts.clear()
             self._sparse_frame_widths.clear()
             self._sparse_relu_slots.clear()
+            self._sparse_aux_slots.clear()
             self._cache_net_id = net_id
             self._var_id_stride = self._net_var_id_stride(net)
             self._sparse_next_frame_id = 0
+            self._sigmoid_affine_targets = (
+                self._find_sigmoid_affine_targets(net)
+                if self._fuse_sigmoid_affine
+                else {}
+            )
 
         self._set_context(net, before, after)
         self._seed_sparse_cache(L, input_bounds)
@@ -436,8 +518,12 @@ class HybridzTF(RegistryTF):
             and self._hz_cache.get(L.id) is hz_before
             and k not in ("INPUT", "INPUT_SPEC")
         ):
-            self._hz_cache[L.id] = hz_from_bounds(
-                result.bounds, result.bounds.lb.dtype, result.bounds.lb.device
-            )
+            if (
+                hz_bounds_are_liftable(result.bounds)
+                and result.bounds.lb.numel() <= self._HZ_MAX_INPUT_DIM
+            ):
+                self._hz_cache[L.id] = hz_lift_bounds(hz_before, result.bounds)
+            else:
+                self._hz_cache.pop(L.id, None)
 
         return result

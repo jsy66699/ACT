@@ -787,7 +787,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.SOFTMAX.value: {
         "params_required": ["axis"],
-        "params_optional": [],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.MHA.value: {
         "params_required": ["num_heads"],

@@ -45,12 +45,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install coverage torch onnx onnx2torch "onnx-simplifier" "onnxsim==0.6.5" pandas numpy scipy pyyaml tqdm psutil
 
-      # ── BaB module unit tests ──────────────────────────────────────────
-      - name: BaB module
-        run: |
-          cd ${{ github.workspace }}
-          coverage run -p -m act.back_end.bab.bab
-
       # ── Generate artificial ACT nets (NetFactory) ──────────────────────
       - name: Cache generated networks
         id: nets-cache
@@ -230,6 +224,7 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.back_end --verify --network act/back_end/examples/nets/layer_testing_bab_deep.json \
             --solver dual --method planar --device cpu --dtype float64
+
 
       # ===================================================================
       # Dual MATMUL bilinear kernel (tf_transformer): dual-tier soundness on

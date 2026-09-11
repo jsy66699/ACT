@@ -60,10 +60,13 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify act2torch --device cpu --dtype float32
 
-      - name: Run Verifier Self-Tests (float32)
+      - name: Constraint exporter — torchlp LP export over all layer_testing nets
         run: |
           cd ${{ github.workspace }}
-          coverage run -p -m act.back_end.verifier
+          for f in act/back_end/examples/nets/layer_testing_*.json; do
+            coverage run -p -m act.back_end --verify --network "$f" \
+              --solver torchlp --device cpu --dtype float32
+          done
 
       # ─────────────────────────────────────────────────────────────────
       # Soundness check (TF-agnostic): runs once before per-solver matrix.

@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch "onnx-simplifier" "onnxsim==0.6.5" tensorflow pandas numpy scipy pyyaml tqdm psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch "onnx-simplifier" "onnxsim==0.6.5" tensorflow pandas numpy scipy highspy pyyaml tqdm psutil transformers scikit-learn
 
       # Network Generation & Basic Tests
 
@@ -65,10 +65,13 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify act2torch --device cpu --dtype float64
 
-      - name: Run Verifier Self-Tests (float64)
+      - name: Constraint exporter — torchlp LP export over all layer_testing nets
         run: |
           cd ${{ github.workspace }}
-          coverage run -p -m act.back_end.verifier
+          for f in act/back_end/examples/nets/layer_testing_*.json; do
+            coverage run -p -m act.back_end --verify --network "$f" \
+              --solver torchlp --device cpu --dtype float64
+          done
 
       # ─────────────────────────────────────────────────────────────────
       # Soundness check (TF-agnostic): runs once before per-solver matrix.
@@ -104,18 +107,24 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify netfactory --validate-soundness --device cpu --dtype float64 --tf-modes hybridz --solvers torchlp
 
+      - name: HybridZ fused Sigmoid-affine projection (float64)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end --verify --network act/back_end/examples/nets/layer_testing_sigmoid.json --device cpu --dtype float64 --tf-mode hybridz --solver torchlp --hz-fuse-sigmoid-affine
+
       # Solver 3: DualSolver (Wong-Kolter dual backward, no LP cascade)
       - name: Solver = dual (Wong-Kolter dual backward, float64)
         run: |
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify netfactory --validate-soundness --device cpu --dtype float64 --solvers dual
 
-      # Spec-kind coverage: RANGE and MARGIN_ROBUST nets explicitly through both LP
-      # and dual paths, plus the UNSAFE_LINEAR EXISTS-row branch through dual.
-      - name: Spec-kind coverage (RANGE / MARGIN / UNSAFE_LINEAR via dual + LP)
+      # Spec-kind coverage: RANGE / MARGIN_ROBUST / UNSAFE_LINEAR through the
+      # standalone HybridZ and dual verdict paths, plus the LP cascade.
+      - name: Spec-kind coverage (RANGE / MARGIN / UNSAFE_LINEAR)
         run: |
           cd ${{ github.workspace }}
           coverage run -p -m act.pipeline --verify netfactory --validate-soundness --device cpu --dtype float64 --tf-modes interval --solvers torchlp --networks layer_testing_range,layer_testing_margin_robust,resnet_4x3x16x16_8x2x1_1277797607
+          coverage run -p -m act.pipeline --verify netfactory --validate-soundness --device cpu --dtype float64 --solvers hybridz --networks layer_testing_range,layer_testing_margin_robust,layer_testing_unsafe_linear
           coverage run -p -m act.pipeline --verify netfactory --validate-soundness --device cpu --dtype float64 --solvers dual --networks layer_testing_range,layer_testing_margin_robust,layer_testing_unsafe_linear,resnet_4x3x16x16_8x2x1_1277797607
 
       - name: List example networks (back_end)

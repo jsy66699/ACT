@@ -448,48 +448,6 @@ def _extract_shape_from_tensor(tensor) -> list:
     return shape
 
 
-def test_onnx_conversion(
-    onnx_path: Path,
-    input_shape: Optional[Tuple[int, ...]] = None,
-    batch_size: int = 1
-) -> bool:
-    """
-    Test ONNX to PyTorch conversion with dummy input.
-    
-    Args:
-        onnx_path: Path to .onnx file
-        input_shape: Input shape (inferred from model if not provided)
-        batch_size: Batch size for test input
-        
-    Returns:
-        True if conversion successful and model runs, False otherwise
-    """
-    try:
-        # Convert model
-        pytorch_model = convert_onnx_to_pytorch(onnx_path)
-        
-        # Get input shape if not provided
-        if input_shape is None:
-            input_shape = get_onnx_input_shape(onnx_path)
-        
-        # Create dummy input
-        dummy_input = torch.randn(batch_size, *input_shape)
-        
-        # Run forward pass
-        with torch.no_grad():
-            output = pytorch_model(dummy_input)
-        
-        logger.info(
-            f"ONNX conversion test passed: "
-            f"input {dummy_input.shape} -> output {output.shape}"
-        )
-        return True
-        
-    except Exception as e:
-        logger.error(f"ONNX conversion test failed: {e}")
-        return False
-
-
 def get_onnx_metadata(onnx_path: Path) -> dict:
     """
     Extract metadata from ONNX model.

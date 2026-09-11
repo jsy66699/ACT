@@ -17,6 +17,8 @@
 # Families:   mlp (plain/block/residual), cnn2d (plain/residual/stage)
 # ===---------------------------------------------------------------------===#
 
+# pyright: reportConstantRedefinition=false
+
 from __future__ import annotations
 
 import functools
@@ -28,7 +30,7 @@ import logging
 import random
 import secrets
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, cast, Dict, FrozenSet, List, Optional, Tuple
 
 import torch  # pyright: ignore[reportMissingImports]
 
@@ -867,6 +869,16 @@ def _generate_layer_variables(kind, i, vc, params, layers):
         n = torch.Size(shape).numel()
         return [], list(range(vc, vc + n)), vc + n
 
+    # Scalar attention cores contract two predecessor vectors. Their source
+    # variable lists are populated by create_network from q_src/k_src or
+    # w_src/v_src before variable allocation.
+    if kind == LayerKind.ATT_SCORES.value:
+        in_vars = list(params["q_vars"]) + list(params["k_vars"])
+        return in_vars, [vc], vc + 1
+    if kind == LayerKind.ATT_MIX.value:
+        in_vars = list(params["w_vars"]) + list(params["v_vars"])
+        return in_vars, [vc], vc + 1
+
     # Binary ops (x_vars + y_vars already populated by create_network)
     x_vars = params.get("x_vars", [])
     y_vars = params.get("y_vars", [])
@@ -1455,6 +1467,13 @@ class NetFactory:
             if "preds" in ls and "preds_indices" not in params:
                 params["preds_indices"] = ls["preds"]
 
+            if kind == LayerKind.ATT_SCORES.value:
+                params["q_vars"] = list(layers[int(params["q_src"])].out_vars)
+                params["k_vars"] = list(layers[int(params["k_src"])].out_vars)
+            elif kind == LayerKind.ATT_MIX.value:
+                params["w_vars"] = list(layers[int(params["w_src"])].out_vars)
+                params["v_vars"] = list(layers[int(params["v_src"])].out_vars)
+
             if kind in (LayerKind.MAX.value, LayerKind.MIN.value):
                 pred_indices = ls.get("preds", [])
                 if pred_indices:
@@ -1464,9 +1483,16 @@ class NetFactory:
                         if p < len(layers)
                     ]
 
-            in_vars, out_vars, vc = _generate_layer_variables(
-                kind, i, vc, params, layers
-            )
+            input_from = ls.get("input_from")
+            if input_from is not None:
+                in_vars = list(layers[int(input_from)].out_vars)
+                n_out = int(params.get("out_features", len(in_vars)))
+                out_vars = list(range(vc, vc + n_out))
+                vc += n_out
+            else:
+                in_vars, out_vars, vc = _generate_layer_variables(
+                    kind, i, vc, params, layers
+                )
 
             if kind == LayerKind.INPUT.value:
                 params["dtype"] = dtype_str
@@ -1477,7 +1503,8 @@ class NetFactory:
             elif kind == LayerKind.ASSERT.value:
                 # B from the InputLayer (layers[0]); n_out from this ASSERT's
                 # in_vars (which equal the upstream output variables).
-                B_assert = int(layers[0].params["shape"][0])
+                input_shape = cast(List[int], cast(object, layers[0].params["shape"]))
+                B_assert = int(input_shape[0])
                 params = self._assert_params(
                     params, dtype, B=B_assert, n_out=len(in_vars),
                 )
@@ -1614,8 +1641,10 @@ class NetFactory:
             for idx in range(self.num_instances):
                 self._generate_one(idx, dtype, names)
 
+        dsl_layer_testing = self.config.get("layer_testing", {})
         print(
-            f"Generating {len(LAYER_TESTING_SPECS)} per-kind layer-testing examples..."
+            f"Generating {len(LAYER_TESTING_SPECS) + len(dsl_layer_testing)} "
+            "layer-testing examples..."
         )
         names.extend(self._generate_layer_testing_examples())
 
@@ -1630,6 +1659,15 @@ class NetFactory:
         names: List[str] = []
         for name, build_spec in LAYER_TESTING_SPECS.items():
             net = self.create_network(name, build_spec())
+            self.save_network(net, name)
+            names.append(name)
+            self.total_generated += 1
+            self._record(net)
+        for architecture, cfg in self.config.get("layer_testing", {}).items():
+            if architecture != "attention":
+                raise ValueError(f"Unsupported layer-testing architecture: {architecture}")
+            name = f"{LAYER_TESTING_NAME_PREFIX}{architecture}"
+            net = self.create_network(name, _lt_spec_attention(cfg))
             self.save_network(net, name)
             names.append(name)
             self.total_generated += 1
@@ -1823,6 +1861,136 @@ def _lt_spec_matmul() -> Dict[str, Any]:
          "inputs": {"x": 1, "y": 2}, "preds": [1, 2]},
         _lt_assert_le([1.0, 0.0, 0.0, 0.0], 100.0),
     ]}
+
+
+def _lt_spec_attention(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Small explicit attention block for the dual bilinear core kernels."""
+    B = int(cfg["batch_size"])
+    L = int(cfg["sequence_length"])
+    D = int(cfg["hidden_size"])
+    if B != 1 or L <= 1 or D <= 1:
+        raise ValueError("attention layer-testing architecture requires B=1 and L,D > 1")
+
+    dtype = get_default_dtype()
+    scale = float(cfg["projection_scale"])
+    seeds = [int(seed) for seed in cfg["projection_seeds"]]
+    if len(seeds) != 3:
+        raise ValueError("attention projection_seeds must contain Q, K, and V seeds")
+    weights = [
+        (
+            torch.randn(
+                D,
+                D,
+                dtype=dtype,
+                device="cpu",
+                generator=torch.Generator(device="cpu").manual_seed(seed),
+            )
+            * scale
+        ).to(get_default_device())
+        for seed in seeds
+    ]
+    Wq, Wk, Wv = weights
+    n_in = L * D
+    lb, ub = (float(v) for v in cfg["input_bounds"])
+    layers = _lt_input([B, n_in], lb, ub)
+
+    def dense_projection(weight: torch.Tensor, position: int) -> int:
+        full = torch.zeros(D, n_in, dtype=dtype)
+        full[:, position * D:(position + 1) * D] = weight
+        layers.append({
+            "kind": LayerKind.DENSE.value,
+            "params": {
+                "weight": full,
+                "in_features": n_in,
+                "out_features": D,
+                "weight_pos": full.clamp(min=0),
+                "weight_neg": full.clamp(max=0),
+                "bias": torch.zeros(D, dtype=dtype),
+                "input_shape": [n_in],
+            },
+            "input_from": 1,
+            "preds": [1],
+        })
+        return len(layers) - 1
+
+    def value_projection(feature: int) -> int:
+        full = torch.zeros(L, n_in, dtype=dtype)
+        for position in range(L):
+            full[position, position * D:(position + 1) * D] = Wv[feature]
+        layers.append({
+            "kind": LayerKind.DENSE.value,
+            "params": {
+                "weight": full,
+                "in_features": n_in,
+                "out_features": L,
+                "weight_pos": full.clamp(min=0),
+                "weight_neg": full.clamp(max=0),
+                "bias": torch.zeros(L, dtype=dtype),
+                "input_shape": [n_in],
+            },
+            "input_from": 1,
+            "preds": [1],
+        })
+        return len(layers) - 1
+
+    q_ids = [dense_projection(Wq, position) for position in range(L)]
+    k_ids = [dense_projection(Wk, position) for position in range(L)]
+    v_ids = [value_projection(feature) for feature in range(D)]
+
+    score_ids = []
+    for key_position in range(L):
+        q_src, k_src = q_ids[0], k_ids[key_position]
+        layers.append({
+            "kind": LayerKind.ATT_SCORES.value,
+            "params": {"dk": math.sqrt(D), "q_src": q_src, "k_src": k_src},
+            "preds": [q_src, k_src],
+        })
+        score_ids.append(len(layers) - 1)
+    layers.append({
+        "kind": LayerKind.CONCAT.value,
+        "params": {"concat_dim": -1},
+        "preds": score_ids,
+    })
+    concat_scores = len(layers) - 1
+    layers.append({
+        "kind": LayerKind.SOFTMAX.value,
+        "params": {"axis": -1},
+        "preds": [concat_scores],
+    })
+    softmax_id = len(layers) - 1
+
+    mix_ids = []
+    for value_id in v_ids:
+        layers.append({
+            "kind": LayerKind.ATT_MIX.value,
+            "params": {
+                "rowsize": L,
+                "w_src": softmax_id,
+                "v_src": value_id,
+            },
+            "preds": [softmax_id, value_id],
+        })
+        mix_ids.append(len(layers) - 1)
+    layers.append({
+        "kind": LayerKind.CONCAT.value,
+        "params": {"concat_dim": -1},
+        "preds": mix_ids,
+    })
+    concat_mix = len(layers) - 1
+    layers.extend([
+        {
+            "kind": LayerKind.LAYERNORM.value,
+            "params": {
+                "gamma": torch.ones(D, dtype=dtype),
+                "beta": torch.zeros(D, dtype=dtype),
+                "variant": str(cfg["layernorm_variant"]),
+            },
+            "preds": [concat_mix],
+        },
+        {"kind": LayerKind.GELU.value, "params": {}},
+        _lt_assert_le([1.0] * D, float(cfg["assert_threshold"])),
+    ])
+    return {"layers": layers}
 
 
 def _lt_spec_arg_extremum() -> Dict[str, Any]:
@@ -2397,11 +2565,13 @@ def _lt_spec_tanh() -> Dict[str, Any]:
 
 
 def _lt_spec_sigmoid() -> Dict[str, Any]:
-    # SIGMOID: input [-3, 3] hits the saturation region, exercising
-    # tf_sigmoid's PWL relaxation in tf_mlp.py.
+    # SIGMOID: input [-3, 3] hits the saturation region; the following DENSE
+    # also exercises HybridZ's optional fused Sigmoid-affine projection.
     return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
         {"kind": LayerKind.SIGMOID.value, "params": {}},
-        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+        {"kind": LayerKind.DENSE.value,
+         "params": {"in_features": 4, "out_features": 3, "use_bias": True}},
+        _lt_assert_le([1.0, 1.0, 1.0], 100.0),
     ]}
 
 

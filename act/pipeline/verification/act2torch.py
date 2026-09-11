@@ -60,6 +60,169 @@ def _align_elementwise_param(param: torch.Tensor, x: torch.Tensor) -> torch.Tens
     return param
 
 
+class ACTErf(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.erf(x)
+
+
+class ACTSqrt(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(torch.clamp(x, min=0.0))
+
+
+class ACTSin(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(x)
+
+
+class ACTCos(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cos(x)
+
+
+class ACTQuantize(nn.Module):
+    def __init__(
+        self,
+        scale: object = None,
+        zero_point: object = None,
+        qmin: int = 0,
+        qmax: int = 255,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("scale", torch.as_tensor(1.0 if scale is None else scale))
+        self.register_buffer(
+            "zero_point", torch.as_tensor(0 if zero_point is None else zero_point)
+        )
+        self.qmin = float(qmin)
+        self.qmax = float(qmax)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.get_buffer("scale").to(device=x.device, dtype=x.dtype)
+        zero_point = self.get_buffer("zero_point").to(device=x.device, dtype=x.dtype)
+        quantized = torch.clamp(
+            torch.round(x / scale),
+            min=self.qmin - zero_point,
+            max=self.qmax - zero_point,
+        )
+        return scale * quantized
+
+
+class ACTMatMul(nn.Module):
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(x, y)
+
+
+class ACTMaskAdd(nn.Module):
+    def __init__(self, mask: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("mask", mask.detach().clone())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask = self.get_buffer("mask").to(device=x.device, dtype=x.dtype)
+        return x + mask
+
+
+class ACTLayerNorm(nn.Module):
+    def __init__(
+        self,
+        gamma: torch.Tensor,
+        beta: torch.Tensor,
+        eps: float,
+        variant: str,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("gamma", gamma.detach().clone())
+        self.register_buffer("beta", beta.detach().clone())
+        self.eps = eps
+        self.variant = variant
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gamma = self.get_buffer("gamma").to(device=x.device, dtype=x.dtype)
+        beta = self.get_buffer("beta").to(device=x.device, dtype=x.dtype)
+        if self.variant == "no_var":
+            dims = tuple(range(1, x.dim()))
+            return (x - x.mean(dim=dims, keepdim=True)) * gamma + beta
+        import torch.nn.functional as F
+
+        return F.layer_norm(x, gamma.shape, weight=gamma, bias=beta, eps=self.eps)
+
+
+class ACTMHASplit(nn.Module):
+    def __init__(
+        self,
+        weight: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        role: str,
+        position: int,
+        feature: int,
+        hidden_size: Optional[int],
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "weight", weight.detach().clone() if isinstance(weight, torch.Tensor) else None
+        )
+        self.register_buffer(
+            "bias", bias.detach().clone() if isinstance(bias, torch.Tensor) else None
+        )
+        self.role = role
+        self.position = position
+        self.feature = feature
+        self.hidden_size = hidden_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.get_buffer("weight")
+        if weight is None:
+            return x
+        import torch.nn.functional as F
+
+        weight = weight.to(device=x.device, dtype=x.dtype)
+        bias = self.get_buffer("bias")
+        if bias is not None:
+            bias = bias.to(device=x.device, dtype=x.dtype)
+        projected = F.linear(x.reshape(x.shape[0], -1, weight.shape[1]), weight, bias)
+        hidden = self.hidden_size or int(projected.shape[-1])
+        sequence_length = projected.shape[1]
+        projected = projected.reshape(x.shape[0], sequence_length, hidden)
+        if self.role in {"query", "key"}:
+            return projected[:, self.position, :]
+        if self.role == "value":
+            return projected[:, :, self.feature]
+        return projected
+
+
+class ACTAttentionScores(nn.Module):
+    def __init__(self, dk: float, mask: Optional[torch.Tensor]) -> None:
+        super().__init__()
+        self.dk = dk
+        self.register_buffer(
+            "mask", mask.detach().clone() if isinstance(mask, torch.Tensor) else None
+        )
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+        output = (query * key).sum(dim=-1, keepdim=True) / self.dk
+        mask = self.get_buffer("mask")
+        if mask is not None:
+            output = output + mask.to(device=output.device, dtype=output.dtype)
+        return output
+
+
+class ACTAttentionMix(nn.Module):
+    def forward(self, weights: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        return (weights * values).sum(dim=-1, keepdim=True)
+
+
+class ACTMHAJoin(nn.Module):
+    def __init__(self, sequence_length: int, hidden_size: Optional[int]) -> None:
+        super().__init__()
+        self.sequence_length = sequence_length
+        self.hidden_size = hidden_size
+
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        output = torch.cat(inputs, dim=-1)
+        hidden_size = self.hidden_size or int(output.shape[-1])
+        return output.reshape(output.shape[0], self.sequence_length, hidden_size)
+
+
 class ActGraphModule(nn.Module):
     """DAG-aware nn.Module for ACT body graphs reconstructed by ACTToTorch.
 
@@ -144,12 +307,6 @@ class ActGraphModule(nn.Module):
             if mod is None:
                 out = self._apply_functional(layer, inp_tensors)
             else:
-                if len(inp_tensors) > 1:
-                    raise NotImplementedError(
-                        f"ActGraphModule: module-backed layer {layer.kind} (id={lid}) "
-                        f"received {len(inp_tensors)} inputs; multi-input module dispatch "
-                        f"not implemented (current torch2act does not emit such nets)."
-                    )
                 if layer.kind == LayerKind.DENSE.value and inp_tensors[0].dim() >= 3:
                     import torch.nn.functional as F
                     output_shape = layer.params.get("output_shape")
@@ -168,7 +325,7 @@ class ActGraphModule(nn.Module):
                     else:
                         out = mod(inp_tensors[0])
                 else:
-                    out = mod(inp_tensors[0])
+                    out = mod(*inp_tensors)
                 # nn.RNN / LSTM / GRU return (output, hidden); MHA returns
                 # (output, attn_weights). Verification only consumes the
                 # primary output tensor, so drop the auxiliary state.
@@ -295,7 +452,7 @@ class ActGraphModule(nn.Module):
             axes = layer.params.get("axes")
             keepdims = bool(layer.params.get("keepdims", 0))
             if axes is None:
-                return torch.sum(inputs[0], keepdim=keepdims)
+                axes = tuple(range(inputs[0].dim()))
             return torch.sum(inputs[0], dim=tuple(int(a) for a in axes), keepdim=keepdims)
         if kind == LayerKind.COMPARE.value:
             if len(inputs) != 2:
@@ -340,7 +497,7 @@ class ActGraphModule(nn.Module):
             mode = str(layer.params.get("mode", "nearest")).lower()
             scale_factor = layer.params.get("scale_factor")
             size = layer.params.get("size")
-            kwargs = {"mode": mode}
+            kwargs: Dict[str, Any] = {"mode": mode}
             if mode != "nearest" and layer.params.get("align_corners") is not None:
                 kwargs["align_corners"] = bool(layer.params["align_corners"])
             if size is not None:
@@ -884,10 +1041,6 @@ class ACTToTorch:
                 LayerKind.ADD.value,
                 LayerKind.CONCAT.value,
                 LayerKind.MUL.value,
-                LayerKind.MHA_SPLIT.value,
-                LayerKind.ATT_SCORES.value,
-                LayerKind.ATT_MIX.value,
-                LayerKind.MHA_JOIN.value,
             }:
                 layer_modules[lid] = None
             else:
@@ -1042,6 +1195,57 @@ class ACTToTorch:
         if kind in (LayerKind.RNN.value, LayerKind.GRU.value, LayerKind.LSTM.value):
             return self._build_rnn_family(act_layer)
 
+        if kind == LayerKind.ERF.value:
+            return ACTErf()
+        if kind == LayerKind.SQRT.value:
+            return ACTSqrt()
+        if kind == LayerKind.SIN.value:
+            return ACTSin()
+        if kind == LayerKind.COS.value:
+            return ACTCos()
+        if kind == LayerKind.QUANTIZE.value:
+            return ACTQuantize(
+                scale=params.get("scale"),
+                zero_point=params.get("zero_point"),
+                qmin=int(cast(Any, params.get("qmin", 0))),
+                qmax=int(cast(Any, params.get("qmax", 255))),
+            )
+        if kind == LayerKind.MATMUL.value:
+            return ACTMatMul()
+        if kind == LayerKind.MASK_ADD.value:
+            return ACTMaskAdd(cast(torch.Tensor, params["M"]))
+        if kind == LayerKind.LAYERNORM.value:
+            variant = str(params.get("variant", params.get("layer_norm", "standard")))
+            return ACTLayerNorm(
+                gamma=cast(torch.Tensor, params["gamma"]),
+                beta=cast(torch.Tensor, params["beta"]),
+                eps=float(cast(Any, params.get("eps", 1e-5))),
+                variant=variant,
+            )
+        if kind == LayerKind.MHA_SPLIT.value:
+            hidden_size = params.get("hidden_size")
+            return ACTMHASplit(
+                weight=cast(Optional[torch.Tensor], params.get("weight")),
+                bias=cast(Optional[torch.Tensor], params.get("bias")),
+                role=str(params.get("role", "")),
+                position=int(cast(Any, params.get("position", 0))),
+                feature=int(cast(Any, params.get("feature", 0))),
+                hidden_size=int(cast(Any, hidden_size)) if hidden_size is not None else None,
+            )
+        if kind == LayerKind.ATT_SCORES.value:
+            return ACTAttentionScores(
+                dk=float(cast(Any, params["dk"])),
+                mask=cast(Optional[torch.Tensor], params.get("mask")),
+            )
+        if kind == LayerKind.ATT_MIX.value:
+            return ACTAttentionMix()
+        if kind == LayerKind.MHA_JOIN.value:
+            hidden_size = params.get("hidden_size")
+            return ACTMHAJoin(
+                sequence_length=int(cast(Any, params.get("seq_len", 1))),
+                hidden_size=int(cast(Any, hidden_size)) if hidden_size is not None else None,
+            )
+
         cls = ACT_TO_TORCH.get(kind)
         if cls is None:
             if "requires_graph_restoration" in spec.get("params_optional", []):
@@ -1050,14 +1254,6 @@ class ACTToTorch:
                     f"no direct nn.Module mapping; handled functionally by ActGraphModule"
                 )
             return None
-
-        if kind == LayerKind.QUANTIZE.value:
-            return cls(
-                scale=params.get("scale"),
-                zero_point=params.get("zero_point"),
-                qmin=int(cast(Any, params.get("qmin", 0))),
-                qmax=int(cast(Any, params.get("qmax", 255))),
-            )
 
         # Build positional args from params_required (excluding tensors)
         # Tensors are auto-detected via isinstance() - they go to state_dict, not constructor
@@ -1126,15 +1322,15 @@ class ACTToTorch:
         """
         kind = act_layer.kind
         params = act_layer.params
-        if int(params.get("num_layers", 1)) != 1:
+        if int(cast(Any, params.get("num_layers", 1))) != 1:
             raise ValueError(
                 f"ACTToTorch: {kind} layer {act_layer.id} has num_layers="
                 f"{params['num_layers']}, only single-layer is supported."
             )
 
         ctor_kwargs: Dict[str, Any] = {
-            "input_size":   int(params["input_size"]),
-            "hidden_size":  int(params["hidden_size"]),
+            "input_size":   int(cast(Any, params["input_size"])),
+            "hidden_size":  int(cast(Any, params["hidden_size"])),
             "num_layers":   1,
             "bidirectional": bool(params.get("bidirectional", False)),
             "batch_first":  bool(params.get("batch_first", False)),
