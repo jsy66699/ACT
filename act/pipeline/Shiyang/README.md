@@ -5,6 +5,7 @@
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/CHANGES_VS_MAIN.md`](docs/CHANGES_VS_MAIN.md) | **与上游 `main` 的差异说明**：58 个改动文件逐个说明为什么改；默认参数下只有 1 个文件会改变上游行为 |
 | [`docs/PARAMETERS.md`](docs/PARAMETERS.md) | **参数说明**：44 个命令行参数的默认值/取值/作用，以及实验里真正用过的 arm 配方 |
 | [`docs/EXPERIMENT_LOG_20260909_smooth_state.md`](docs/EXPERIMENT_LOG_20260909_smooth_state.md) | 光滑激活（Sigmoid/Tanh）上的 state 准入与三段状态码，两轮实验 |
 | [`docs/EXPERIMENT_LOG_20260827_28.md`](docs/EXPERIMENT_LOG_20260827_28.md) | 五个 benchmark 的调度线实验，18 节 |
