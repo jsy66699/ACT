@@ -451,7 +451,8 @@ def load_vnnlib_pair(
     root_dir: Optional[str] = None,
     auto_download: bool = True,
     onnx_model_g: Optional[str] = None,
-    onnx_cache: Optional[Dict[str, Any]] = None
+    onnx_cache: Optional[Dict[str, Any]] = None,
+    model_batch_size: int = 1
 ) -> Dict[str, Any]:
     """
     Load a VNNLIB benchmark instance (ONNX model + VNNLIB spec).
@@ -466,6 +467,9 @@ def load_vnnlib_pair(
         root_dir: Root directory for VNNLIB data (default: from path_config)
         auto_download: If True, download category if not found locally
         onnx_model_g: Optional second ONNX model for dual-model instances
+        model_batch_size: Batch size to pin a symbolic batch dimension to
+            during conversion. Only matters for graphs whose shapes depend on
+            the batch (attention); see convert_onnx_to_pytorch.
         onnx_cache: Read/write memo for everything that depends only on the ONNX
             file(s): the converted modules ('model', plus 'model_f'/'model_g' for
             dual-model instances) and the declared 'input_shape'.  Missing entries
@@ -550,7 +554,8 @@ def load_vnnlib_pair(
     else:
         logger.info("[1/3] Converting ONNX model to PyTorch...")
         try:
-            pytorch_model = convert_onnx_to_pytorch(onnx_path, simplify=True)
+            pytorch_model = convert_onnx_to_pytorch(
+                onnx_path, simplify=True, batch_size=model_batch_size)
             pytorch_model.eval()
             logger.info(f"  ✓ Model converted successfully")
         except ONNXConversionError as e:
@@ -559,7 +564,8 @@ def load_vnnlib_pair(
         pytorch_model_g = None
         if onnx_path_g is not None:
             try:
-                pytorch_model_g = convert_onnx_to_pytorch(onnx_path_g, simplify=True)
+                pytorch_model_g = convert_onnx_to_pytorch(
+                    onnx_path_g, simplify=True, batch_size=model_batch_size)
                 pytorch_model_g.eval()
                 logger.info(f"  ✓ Second model converted successfully")
             except ONNXConversionError as e:

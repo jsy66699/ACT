@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# RandomStartPGD Configuration (ablation baseline for PatternSearchPGD)
+# ═══════════════════════════════════════════════════════════════════════════
+# Plain random-restart PGD: no ReLU-pattern targeting or diversity pool, just
+# a fresh uniform-random start in the input box followed by attack PGD.
+#
+# Precedence:  CLI flag  >  this file  >  code default
+#
+# Point category/max_instances/instance_index/model_index at the same
+# instance as act/config/pattern_search_pgd.yaml for an apples-to-apples
+# comparison of the two methods' counterexample yield.
+
+# Benchmark category under data/vnnlib/<category>/ (must be downloaded already).
+category: "challenging_certified_training_2026"
+
+# How many instances to load from that category's instances.csv (in row order).
+max_instances: 1
+
+# Which loaded instance to run, by index (0-based). null = the first loaded instance.
+instance_index: 27
+
+# Which synthesized wrapped model to use for that instance (>0 only occurs
+# for OR-disjunct VNNLIB properties).
+model_index: 0
+
+# Number of independent random-start PGD attempts.
+restarts: 500
+
+# Print progress every N restarts (0 = silent).
+report_interval: 1
+
+# Attack-loss PGD steps per restart (also used as the Auto-PGD iteration
+# budget when attack_strategy is "apgd_t" or "apgd_ce").
+pgd_steps: 50
+# PGD step size. null = auto (max input-box width / pgd_steps).
+# Only used when attack_strategy is "pgd" or "pgd_ce_bin" -- the other
+# apgd_* strategies' Auto-PGD adapts its own step size.
+pgd_step_size:
+
+# Attack strategy: "pgd" (plain violation-loss PGD, pgd_steps/pgd_step_size
+# above), "apgd_ce" (untargeted Auto-PGD with cross-entropy loss),
+# "apgd_dlr" (untargeted Auto-PGD with the untargeted DLR margin -- tracks
+# violation_score more directly than CE, without committing to one target
+# class), "apgd_cw" (untargeted Auto-PGD with the raw/unnormalized CW
+# margin -- the same quantity "pgd" ascends with fixed-step sign-PGD,
+# isolating whether Auto-PGD's momentum/step adaptation helps on its own),
+# "apgd_t" (targeted Auto-PGD with DLR loss against each restart's own top
+# apgd_t_target_classes classes), "apgd_ce_t" (same single-target-class
+# structure as apgd_t, but ascending -cross_entropy(out, t) per candidate
+# target instead of DLR -- isolates whether apgd_t's edge comes from
+# targeting one class at all, or from DLR's normalization specifically),
+# "apgd_ce_bin" (pure two-class Auto-PGD: softmax CE over ONLY {true class,
+# ce_bin_target_class}, every other class left out of the loss entirely,
+# with the SAME fixed target class attacked every restart -- no per-restart
+# top-k search), or "pgd_ce_bin" (apgd_ce_bin's plain fixed-step-PGD
+# counterpart, using pgd_step_size like "pgd" instead of Auto-PGD) -- see
+# auto_attack_pgd.py's APGD-CE/APGD-T stages for the same underlying
+# algorithms behind the apgd_* modes. apgd_t/apgd_ce_t cost roughly
+# apgd_t_target_classes times as much per restart as the others, so with
+# restarts this high consider lowering restarts before switching to either.
+# NOTE: must be underscored (apgd_ce_bin), not hyphenated -- this is a plain
+# string match against args.attack_strategy, not argparse choices, so a typo
+# here silently falls through to "pgd" instead of erroring.
+attack_strategy: "apgd-dlr"
+
+# Only used when attack_strategy: "apgd_t" or "apgd_ce_t" -- how many of
+# each restart's own top classes (by its current logits) to try as targets.
+apgd_t_target_classes: 5
+
+# Only used when attack_strategy: "apgd_ce_bin" or "pgd_ce_bin" -- the
+# fixed target class every restart is attacked toward, alongside the
+# instance's true label. Default 72 = instance 11's observed
+# true=73 -> misclassified-as=72 direction.
+ce_bin_target_class: 72
+
+# Reporting only (doesn't affect which restarts get attacked): a restart's
+# starting-point ReLU sign pattern only counts toward the seed-pool stats in
+# the summary/CSV if it differs from every pattern already counted by at
+# least this many neurons -- the same rule PatternSearchPGD's phase-1 pool
+# uses, so seed_pool_size is directly comparable to PatternSearchPGD's
+# pool_size for the same attempt budget.
+min_diversity_hamming: 1

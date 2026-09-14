@@ -1,0 +1,8 @@
+{
+  "category": "eran_sigmoid_tanh_mlp",
+  "source": "https://huggingface.co/datasets/zhouxingshi/GenBaB (eran/*), models originally from ETH SRI ERAN",
+  "description": "MNIST fully-connected Sigmoid/Tanh networks (6x100, 6x200, 9x100), L-inf robustness on the first 100 MNIST test images, epsilon per GenBaB configs",
+  "num_instances": 590,
+  "num_onnx_models": 6,
+  "vnnlib_version": "2.0"
+}

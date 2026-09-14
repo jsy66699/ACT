@@ -225,12 +225,31 @@ class GlobalCov(CoverageStrategy):
     activations, enabling O(1) vectorized lookup instead of Python set iteration.
     """
 
-    def __init__(self, model: nn.Module, threshold: float = 0.1):
+    def __init__(self, model: nn.Module, threshold: float = 0.1,
+                 per_instance: int = 0):
         super().__init__(model, threshold)
 
         self._layer_neuron_counts: Dict[str, int] = {}
         self._covered_masks: Dict[str, torch.Tensor] = {}
         self.last_newly_covered_count: int = 0
+        # per_instance > 0 keeps ONE coverage row per verification instance
+        # instead of a single union over the whole batch.
+        #
+        # Why this is a real choice and not a detail: with a single union, a
+        # sample counts as interesting only if it fires a neuron NO instance
+        # has ever fired. Instance A firing a neuron in iteration 3 silently
+        # raises the bar for the other 99 instances for the rest of the run,
+        # and the bar keeps rising as the batch explores -- so the same
+        # benchmark gets a harsher admission rule purely for being run in a
+        # bigger batch. At B=1 the two modes are identical, which is why this
+        # only shows up once batching exists. Measured consequence of the
+        # union rule: the coverage arm's corpus stalls at ~273 live seeds
+        # against ~3010 for state-based admission.
+        #
+        # State admission (PatternStateManager) is already per instance --
+        # its fingerprints carry original_index -- so this makes the coverage
+        # path agree with it rather than compete on a different scope.
+        self._per_instance = int(per_instance)
 
     def _ensure_layer_registered(
         self, layer_name: str, neuron_count: int, device: torch.device
@@ -241,12 +260,15 @@ class GlobalCov(CoverageStrategy):
         if layer_name in self._layer_neuron_counts:
             return
         self._layer_neuron_counts[layer_name] = neuron_count
+        shape = ((self._per_instance, neuron_count) if self._per_instance > 0
+                 else (neuron_count,))
         self._covered_masks[layer_name] = torch.zeros(
-            neuron_count, dtype=torch.bool, device=device
+            shape, dtype=torch.bool, device=device
         )
 
     def update(
-        self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor]
+        self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor],
+        rows: Optional[torch.Tensor] = None,
     ) -> Tuple[float, torch.Tensor]:
         """
         Update global union neuron coverage with batch activations.
@@ -275,15 +297,38 @@ class GlobalCov(CoverageStrategy):
             self._ensure_layer_registered(layer_name, n_neurons, device=mat.device)
             
             fired_mask = mat > float(self.threshold)  # (N, neurons)
-            already_covered = self._covered_masks[layer_name]  # (neurons,)
-            
+            already_covered = self._covered_masks[layer_name]
+
+            if self._per_instance > 0 and rows is None:
+                # The mask is [instances, neurons] here; the union path below
+                # would broadcast it against [N, neurons] and silently produce
+                # nonsense. A caller that scopes coverage per instance has to
+                # say which instance each lane belongs to.
+                raise ValueError(
+                    "GlobalCov(per_instance>0).update() needs rows= (one "
+                    "instance index per lane); got None."
+                )
+            if self._per_instance > 0:
+                idx = rows.to(already_covered.device).long()
+                # Each lane is scored against ITS OWN instance's row.
+                already_lane = already_covered[idx]                    # (N, neurons)
+                newly_lane = fired_mask & ~already_lane
+                interesting_mask |= newly_lane.any(dim=1).cpu()
+                # index_add_ on an integer accumulator, not index_put_: the
+                # corpus samples with replacement, so several lanes can carry
+                # the SAME instance and index_put_ would keep only one of them.
+                acc = torch.zeros_like(already_covered, dtype=torch.uint8)
+                acc.index_add_(0, idx, fired_mask.to(torch.uint8))
+                self._covered_masks[layer_name] = already_covered | (acc > 0)
+                continue
+
             fired_any = fired_mask.any(dim=0)  # (neurons,)
             newly_covered = fired_any & ~already_covered  # (neurons,)
-            
+
             if newly_covered.any():
                 # (N, neurons) & (1, neurons) → (N, neurons) → any(dim=1) → (N,)
                 interesting_mask |= (fired_mask & newly_covered.unsqueeze(0)).any(dim=1)
-            
+
             # Update coverage mask in-place (bitwise OR)
             self._covered_masks[layer_name] = already_covered | fired_any
         
@@ -294,7 +339,11 @@ class GlobalCov(CoverageStrategy):
         return global_delta, interesting_mask
 
     def _total_covered(self) -> int:
-        return sum(int(m.sum()) for m in self._covered_masks.values())
+        """Union over instances, always -- the REPORTED coverage must stay
+        comparable across arms, so per-instance mode changes what counts as
+        interesting, not what gets reported."""
+        return sum(int((m.any(dim=0) if m.dim() > 1 else m).sum())
+                   for m in self._covered_masks.values())
 
     def _total_neurons(self) -> int:
         return sum(self._layer_neuron_counts.values())
@@ -308,6 +357,10 @@ class GlobalCov(CoverageStrategy):
     def get_uncovered_neurons(self) -> Set[NeuronId]:
         result: Set[NeuronId] = set()
         for layer_name, mask in self._covered_masks.items():
+            # Union over instances in per-instance mode: "uncovered" for
+            # reporting (and for HPGD-Cov's target pool) means no instance has
+            # fired it, not "this instance has not".
+            mask = mask.any(dim=0) if mask.dim() > 1 else mask
             for idx in (~mask).nonzero(as_tuple=True)[0].tolist():
                 result.add((layer_name, int(idx)))
         return result
@@ -315,6 +368,7 @@ class GlobalCov(CoverageStrategy):
     def get_covered_neurons(self) -> Set[NeuronId]:
         result: Set[NeuronId] = set()
         for layer_name, mask in self._covered_masks.items():
+            mask = mask.any(dim=0) if mask.dim() > 1 else mask
             for idx in mask.nonzero(as_tuple=True)[0].tolist():
                 result.add((layer_name, int(idx)))
         return result
@@ -350,11 +404,17 @@ class CoverageTracker:
         self,
         model: nn.Module,
         threshold: float = 0.1,
-        strategy: str = "BestInputCov"
+        strategy: str = "BestInputCov",
+        per_instance: int = 0,
     ):
         self.model = model
         self.threshold = threshold
         self.strategy = strategy
+        # >0 scopes GlobalCov's "already covered" per verification instance
+        # instead of one union over the batch; 0 (default) is the original
+        # union. Only GlobalCov honours it -- BestInputCov is per INPUT, a
+        # different axis, and keeps no union at all.
+        self.per_instance = int(per_instance)
         self._strategies: Dict[str, CoverageStrategy] = {}
         
         if strategy not in self._REGISTRY:
@@ -365,14 +425,18 @@ class CoverageTracker:
         if name not in self._strategies:
             if name not in self._REGISTRY:
                 raise ValueError(f"Unknown coverage strategy '{name}'. Valid: {list(self._REGISTRY.keys())}")
-            self._strategies[name] = self._REGISTRY[name](model=self.model, threshold=self.threshold)
+            kwargs = {"model": self.model, "threshold": self.threshold}
+            if name == "GlobalCov" and self.per_instance > 0:
+                kwargs["per_instance"] = self.per_instance
+            self._strategies[name] = self._REGISTRY[name](**kwargs)
         return self._strategies[name]
 
     def update(
         self,
         input_tensor: torch.Tensor,
         activations: Dict[str, torch.Tensor],
-        strategy: Optional[str] = None
+        strategy: Optional[str] = None,
+        rows: Optional[torch.Tensor] = None,
     ) -> Tuple[float, torch.Tensor]:
         """
         Update coverage with activations from a fuzzing iteration.
@@ -391,7 +455,12 @@ class CoverageTracker:
             - interesting_mask: BoolTensor (N,), True for interesting samples
         """
         s = strategy if strategy is not None else self.strategy
-        return self._get_strategy(s).update(input_tensor, activations)
+        strat = self._get_strategy(s)
+        # Only GlobalCov can scope by instance; BestInputCov is per INPUT, a
+        # different axis, and its update() takes no rows.
+        if rows is not None and isinstance(strat, GlobalCov):
+            return strat.update(input_tensor, activations, rows=rows)
+        return strat.update(input_tensor, activations)
 
     def get_coverage(self, strategy: Optional[str] = None) -> float:
         s = strategy if strategy is not None else self.strategy

@@ -73,10 +73,20 @@ class VNNLibSpecCreator(BaseSpecCreator):
         categories: Optional[List[str]] = None,
         max_instances: Optional[int] = None,
         validate_shapes: bool = True,
-        instance_indices: Optional[List[int]] = None
+        instance_indices: Optional[List[int]] = None,
+        batch_conversion: bool = False
     ) -> List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]:
         """
         Create specs for VNNLIB benchmark instances.
+
+        batch_conversion=True pins each ONNX's symbolic batch dimension to the
+        number of selected instances sharing it, instead of to 1. Needed only
+        for graphs whose shapes depend on the batch -- attention graphs, which
+        Reshape by a computed shape -- since those come out of onnx2torch
+        usable at the pinned batch alone. Off by default: for every graph whose
+        shapes do not depend on the batch the conversion is identical either
+        way, and pinning to something other than 1 would be a silent change to
+        benchmarks that already work.
         
         Unified return format: List of (data_source, model_name, pytorch_model, labeled_tensors, spec_pairs)
         
@@ -187,7 +197,21 @@ class VNNLibSpecCreator(BaseSpecCreator):
         # place, so a process-wide cache could hand back a model mutated for a
         # different run.
         _onnx_cache: Dict[Tuple[str, str, Optional[str]], Dict[str, Any]] = {}
-        
+
+        # How many of the selected instances share each ONNX file. A graph
+        # whose shapes depend on the batch is only usable at the batch it was
+        # converted at, and model_synthesis groups those instances into ONE
+        # batch of exactly this size -- so pinning the conversion to this count
+        # is what lets such a group run batched at all. Counted here rather
+        # than in the loader because only this scope sees the whole selection.
+        _per_onnx_count: Dict[Tuple[str, str, Optional[str]], int] = {}
+        for _inst in all_instances:
+            _g = None
+            if _inst.get('is_dual_model') and len(_inst.get('onnx_models', [])) > 1:
+                _g = _inst['onnx_models'][1][1]
+            _k = (_inst['category'], _inst['onnx_model'], _g)
+            _per_onnx_count[_k] = _per_onnx_count.get(_k, 0) + 1
+
         for instance_info in all_instances:
             category = instance_info['category']
             onnx_model = instance_info['onnx_model']
@@ -211,7 +235,9 @@ class VNNLibSpecCreator(BaseSpecCreator):
                     vnnlib_spec=vnnlib_spec,
                     onnx_model_g=onnx_model_g,
                     auto_download=False,  # Already filtered to downloaded
-                    onnx_cache=_onnx_cache.setdefault(cache_key, {})
+                    onnx_cache=_onnx_cache.setdefault(cache_key, {}),
+                    model_batch_size=(_per_onnx_count.get(cache_key, 1)
+                                      if batch_conversion else 1),
                 )
                 
                 # Generate specs for this instance
@@ -219,7 +245,9 @@ class VNNLibSpecCreator(BaseSpecCreator):
                     category=category,
                     instance_id=instance_id,
                     instance_data=instance_data,
-                    validate_shapes=validate_shapes
+                    validate_shapes=validate_shapes,
+                    model_batch_size=(_per_onnx_count.get(cache_key, 1)
+                                      if batch_conversion else 1)
                 )
                 
                 if result is not None:
@@ -238,7 +266,8 @@ class VNNLibSpecCreator(BaseSpecCreator):
         category: str,
         instance_id: str,
         instance_data: Dict,
-        validate_shapes: bool
+        validate_shapes: bool,
+        model_batch_size: int = 1
     ) -> Optional[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]:
         """
         Create specs for a single VNNLIB instance.
@@ -281,7 +310,8 @@ class VNNLibSpecCreator(BaseSpecCreator):
             validated_pairs = self._validate_and_filter_specs(
                 spec_pairs,
                 pytorch_model,
-                labeled_tensor.tensor
+                labeled_tensor.tensor,
+                model_batch_size
             )
             
             if not validated_pairs:

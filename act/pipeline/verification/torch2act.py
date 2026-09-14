@@ -201,6 +201,31 @@ class _LayerGraphBuilder:
     def _same_size_forward(self) -> List[int]:
         """Allocate same number of output vars as current prev_out."""
         return self._alloc_ids(len(self.prev_out))
+
+    def _per_sample_forward(self, output_shape: Tuple[int, ...]) -> List[int]:
+        """Allocate one output var per element of ONE sample, dropping the
+        batch dimension the input vars still carry.
+
+        The input vars are allocated as ``_prod(self.input_shape)``, batch
+        included, and every real layer downstream allocates per-sample:
+        ``_convert_conv2d`` takes ``out_c*out_h*out_w`` and ``_convert_linear``
+        takes ``out_features``. A CNN therefore drops the batch at its first
+        conv and is consistent from there on. An MLP's first shape-changing
+        layer is a flatten, which used ``_same_size_forward`` and so kept the
+        batch -- leaving FLATTEN with ``B*N`` out_vars while its recorded
+        ``output_shape`` is per-sample. Interval propagation checks both
+        (``tf_flatten``, act/back_end/interval_tf/tf_cnn.py:313 and :323) and
+        no batch size can satisfy them at once: pass B rows and out_vars is B
+        times too long, fold the batch into one row and output_shape no longer
+        matches. That is why every pure-MLP benchmark (mnist_fc, and any
+        acasxu/tllverifybench/cora built the same way) silently lost its
+        unstable mask at B>1 and fell back to "every neuron is a candidate".
+
+        For B=1 this returns exactly what ``_same_size_forward`` did, so
+        single-instance graphs -- which is every graph the verifier itself
+        builds -- are unchanged.
+        """
+        return self._alloc_ids(_prod(output_shape[1:]) or 1)
     
     def _add_layer(self, kind: str, params: Dict[str, Any],
                    in_vars: List[int], out_vars: List[int]) -> int:
@@ -1295,7 +1320,11 @@ class _LayerGraphBuilder:
                 _prod(self.shape[start_dim:end_dim + 1]),
                 *self.shape[end_dim + 1:],
             )
-            out_vars = self._same_size_forward()
+            # start_dim 0 flattens the batch itself away, which is a genuine
+            # batch-mixing op -- keep the old allocation there and normalise
+            # only the ordinary "flatten each sample" case.
+            out_vars = (self._same_size_forward() if start_dim == 0
+                        else self._per_sample_forward(output_shape))
             layer_id = self._add_layer(
                 LayerKind.FLATTEN.value,
                 {
@@ -1384,9 +1413,9 @@ class _LayerGraphBuilder:
     def _create_flatten_layer(self, node_name: Optional[str] = None,
                                start_dim: int = 1, end_dim: int = -1) -> List[int]:
         """Create FLATTEN layer, optionally register node."""
-        out_vars = self._same_size_forward()
         output_shape = (1, _prod(self.shape[1:]))
-        
+        out_vars = self._per_sample_forward(output_shape)
+
         params = {
             "input_shape": self.shape, "output_shape": output_shape,
             "start_dim": start_dim, "end_dim": end_dim

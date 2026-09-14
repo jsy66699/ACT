@@ -25,3 +25,14 @@ fuzzing_results_vnnlib/*
 .cov.*
 coverage.xml
 htmlcov/
+
+# ---- slim-experiments branch -------------------------------------------
+# Result data: every fuzzing run writes here (124 GB locally). Only the
+# shell drivers that LAUNCH the campaigns are kept.
+act/pipeline/Shiyang/results/*
+!act/pipeline/Shiyang/results/*.sh
+# A nested copy of results/ produced by running the driver from the wrong cwd.
+act/pipeline/Shiyang/act/
+# Scratch outputs from the analysis scripts.
+act/pipeline/Shiyang/configs/*.tmp
+.idea/

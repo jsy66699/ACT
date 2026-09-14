@@ -1,0 +1,104 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# PatternSearchPGD Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+# Which VNNLIB benchmark/instance act.pipeline.fuzzing.pattern_search_pgd runs
+# by default.
+#
+# Precedence:  CLI flag  >  this file  >  code default
+# (an explicit --category/--max-instances/--instance-index/--model-index on
+# the command line always wins; leave a key out or null to fall through)
+
+# Benchmark category under data/vnnlib/<category>/ (must be downloaded already).
+category: "challenging_certified_training_2026"
+
+# How many instances to load from that category's instances.csv (in row order).
+max_instances: 1
+
+# Which loaded instance to run, by index (0-based). null = the first loaded
+# instance (equivalent to instance_index: 0 when max_instances: 1).
+instance_index: 27
+
+# Which synthesized wrapped model to use for that instance (>0 only occurs
+# for OR-disjunct VNNLIB properties).
+model_index: 0
+
+# Phase 1: number of independent random-flip projection attempts (round 1).
+collect_iterations: 50
+
+# Round 2 (opt-in): additional attempts restricted to the neurons round 1
+# empirically found to actually flip at least once. 0 = skip round 2 (and
+# round 3, since round 3 needs a round-2 counterexample to anchor on).
+round2_iterations: 50
+
+# Round 3 (opt-in): additional attempts gradient-walking back toward a known
+# round-2 counterexample's own pattern. Only runs if round2_iterations > 0
+# AND round 2 actually found a counterexample. 0 = skip round 3.
+round3_iterations: 500
+
+# Round 3: halve the gradient-walk step size at the same fractional
+# checkpoints Auto-PGD/HPGDMutation use (0.22, 0.41, 0.60, 0.75, 0.88 of
+# --pattern-steps, the round-1/round-3 projection step count -- a separate
+# CLI-only knob from pgd_steps above, which is phase 2's attack budget).
+# Without this, round 3's fixed step size routinely overshoots the anchor's
+# own pattern late in the walk instead of settling into it. Confirmed
+# empirically on a real round2 anchor (acasxu_2023 instance 46): best-point
+# tracking alone barely moves round3's hit-rate (13.6% vs the un-decayed
+# loop's 15.6%), while step_decay on top takes it to 82.8% hit-rate and 5x
+# more total counterexamples across all three rounds for the same attempt
+# budget.
+round3_step_decay: true
+
+# Round 3: stop a sample's gradient walk back toward its anchor's pattern
+# as soon as the achieved Hamming distance to it is <= this many neurons.
+# Smaller = demands landing closer to the anchor's exact pattern before the
+# walk stops (denser sampling right around the known-violating region,
+# fewer kept points overall); larger = accepts more distant neighbors
+# (broader sampling, more points kept, but each less similar to the anchor).
+round3_hamming_radius: 0
+
+# Print progress every N attempts/attacks (0 = silent).
+report_interval: 1
+
+# Phase 2: attack-loss PGD steps per pooled point (also used as the Auto-PGD
+# iteration budget when attack_strategy is "apgd_t" or "apgd_ce").
+pgd_steps: 50
+
+# Phase 2: PGD step size. null = auto (max input-box width / pgd_steps).
+# Only used when attack_strategy is "pgd" or "pgd_ce_bin" -- the other
+# apgd_* strategies' Auto-PGD adapts its own step size.
+pgd_step_size:
+
+# Phase 2 attack: "pgd" (plain violation-loss PGD, pgd_steps/pgd_step_size
+# above), "apgd_ce" (untargeted Auto-PGD with cross-entropy loss),
+# "apgd_dlr" (untargeted Auto-PGD with the untargeted DLR margin -- tracks
+# violation_score more directly than CE, without committing to one target
+# class), "apgd_cw" (untargeted Auto-PGD with the raw/unnormalized CW
+# margin -- the same quantity "pgd" ascends with fixed-step sign-PGD,
+# isolating whether Auto-PGD's momentum/step adaptation helps on its own),
+# "apgd_t" (targeted Auto-PGD with DLR loss against each pooled point's own
+# top apgd_t_target_classes classes), "apgd_ce_t" (same single-target-
+# class structure as apgd_t, but ascending -cross_entropy(out, t) per
+# candidate target instead of DLR -- isolates whether apgd_t's edge comes
+# from targeting one class at all, or from DLR's normalization
+# specifically), "apgd_ce_bin" (pure two-class Auto-PGD: softmax CE over
+# ONLY {true class, ce_bin_target_class}, every other class left out of the
+# loss entirely, with the SAME fixed target class attacked every point --
+# no per-point top-k search), or "pgd_ce_bin" (apgd_ce_bin's plain fixed-
+# step-PGD counterpart, using pgd_step_size like "pgd" instead of Auto-PGD)
+# -- see auto_attack_pgd.py's APGD-CE/APGD-T stages for the same underlying
+# algorithms behind the apgd_* modes.
+# NOTE: must be underscored (apgd_ce_bin), not hyphenated -- this is a plain
+# string match against args.attack_strategy, not argparse choices, so a
+# typo here silently falls through to "pgd" instead of erroring.
+attack_strategy: "apgd-ce"
+
+# Only used when attack_strategy: "apgd_t" or "apgd_ce_t" -- how many of
+# each pooled point's own top classes (by its current logits) to try as
+# targets.
+apgd_t_target_classes: 5
+
+# Only used when attack_strategy: "apgd_ce_bin" or "pgd_ce_bin" -- the
+# fixed target class every point is attacked toward, alongside the
+# instance's true label. Default 72 = instance 11's observed
+# true=73 -> misclassified-as=72 direction.
+ce_bin_target_class: 72

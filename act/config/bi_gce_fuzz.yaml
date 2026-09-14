@@ -1,0 +1,38 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# BiGceFuzz Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+# Which single VNNLIB instance act.pipeline.fuzzing.bi_gce_fuzz runs ACTFuzzer
+# against, and this run's iteration/time budget.
+#
+# BI/GCE itself (enable_bi_gce, mutation_weights, PatternStateManager tuning,
+# ...) is NOT configured here -- it comes from act/config/pipeline.yaml's
+# `fuzzing:` section, same as every other ACTFuzzer entrypoint.
+#
+# Precedence:  CLI flag  >  this file  >  code default
+#
+# Point category/instance_index/model_index at the same instance as
+# pattern_search_pgd.yaml / random_start_pgd.yaml / auto_attack_pgd.yaml for
+# an apples-to-apples comparison of BI/GCE's counterexample yield against
+# those PGD-family ablations.
+
+# Benchmark category under data/vnnlib/<category>/ (must be downloaded already).
+category: "cifar100_2024"
+
+# How many instances to load from that category's instances.csv (in row order).
+max_instances: 1
+
+# Which loaded instance to run, by index (0-based). null = the first loaded instance.
+instance_index: 11
+
+# Which synthesized wrapped model to use for that instance (>0 only occurs
+# for OR-disjunct VNNLIB properties).
+model_index: 0
+
+# Max fuzzing iterations for this run (FuzzingConfig.max_iterations override).
+iterations: 5000
+
+# Wall-clock time budget in seconds (FuzzingConfig.timeout_seconds override).
+timeout: 300.0
+
+# Print progress every N iterations (0 = silent).
+report_interval: 1

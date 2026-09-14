@@ -180,13 +180,24 @@ def _fold_dequantize_initializers(onnx_model):
     return onnx_model
 
 
-def _preprocess_onnx_for_onnx2torch(onnx_model):
+def _preprocess_onnx_for_onnx2torch(onnx_model, batch_size: int = 1):
     """Workarounds for onnx2torch quirks. Called on both main and retry paths.
 
-    1. Symbolic batch dim (vit_2023): set first ``dim_value=0`` → 1. Must
+    1. Symbolic batch dim (vit_2023): set first ``dim_value=0`` → ``batch_size``.
+       Must
        ``ClearField('dim_param')`` first since ``dim_value`` / ``dim_param``
        are a protobuf oneof. Only normalise the first dim; leave variable
        spatial dims alone so we don't mask real shape-concreteness errors.
+
+       The pinned value is BAKED IN, not just declared: onnxsim constant-folds
+       the graph against it, and a graph whose shapes depend on the batch --
+       every attention graph, which concatenates a CLS token and then Reshapes
+       by a computed shape -- comes out of onnx2torch usable at that batch size
+       ALONE. vit_2023 pinned at 1 then fails at B=4 with "size of tensor a
+       (401) must match tensor b (5)", 401 being 100*4+1 tokens folded from the
+       batch axis. Pinning to the lane count the caller will actually use is
+       what makes a batched run possible; 1 remains the default so every
+       benchmark whose shapes do not depend on the batch is untouched.
     2. Empty Clip max input (cctsdb_yolo_2023): trim trailing empty input
        slots so onnx2torch's clip.py doesn't see them as present.
     """
@@ -194,7 +205,7 @@ def _preprocess_onnx_for_onnx2torch(onnx_model):
         dims = list(inp.type.tensor_type.shape.dim)
         if dims and dims[0].dim_value == 0:
             dims[0].ClearField('dim_param')
-            dims[0].dim_value = 1
+            dims[0].dim_value = int(batch_size)
     for node in onnx_model.graph.node:
         if node.op_type == 'Clip':
             while len(node.input) > 1 and not node.input[-1]:
@@ -205,7 +216,8 @@ def _preprocess_onnx_for_onnx2torch(onnx_model):
 
 def convert_onnx_to_pytorch(
     onnx_path: Path,
-    simplify: bool = True
+    simplify: bool = True,
+    batch_size: int = 1,
 ) -> nn.Module:
     """
     Convert ONNX model to PyTorch nn.Module.
@@ -213,6 +225,11 @@ def convert_onnx_to_pytorch(
     Args:
         onnx_path: Path to .onnx file
         simplify: Whether to simplify ONNX model before conversion
+        batch_size: Value to pin a SYMBOLIC batch dimension to before
+            simplification. Graphs whose shapes depend on the batch (attention,
+            which Reshapes by a computed shape) are only usable at the pinned
+            size, so a batched caller must pass its lane count. Default 1 keeps
+            the historical behaviour for every other graph.
         
     Returns:
         PyTorch nn.Module equivalent to ONNX model
@@ -243,7 +260,7 @@ def convert_onnx_to_pytorch(
         except Exception as e:
             logger.warning(f"Opset upgrade failed ({e}), proceeding with original opset")
         
-        onnx_model = _preprocess_onnx_for_onnx2torch(onnx_model)
+        onnx_model = _preprocess_onnx_for_onnx2torch(onnx_model, batch_size)
 
         # Optionally simplify
         if simplify:
@@ -285,7 +302,7 @@ def convert_onnx_to_pytorch(
                 # Apply the same preprocessing here too -- without it, the
                 # fallback can hit the very issues the main path's
                 # _preprocess_onnx_for_onnx2torch was added to fix.
-                raw_model = _preprocess_onnx_for_onnx2torch(raw_model)
+                raw_model = _preprocess_onnx_for_onnx2torch(raw_model, batch_size)
                 try:
                     from onnx import shape_inference
                     raw_model = shape_inference.infer_shapes(raw_model)

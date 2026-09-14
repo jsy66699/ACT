@@ -425,6 +425,16 @@ class PGDMutation(GradientMutation):
         """
         super().__init__(output_spec, perturb_size, logit_sink=logit_sink)
         self.num_steps = int(num_steps)
+        # >0 pulls a coordinate off the box wall once the clamp has bitten it
+        # that many consecutive steps; 0 (default) is the original behaviour.
+        self.wall_recycle = 0
+        # "step" (default) projects after every step -- this is the P in PGD.
+        # "final" runs the ascent unconstrained and projects once at the end,
+        # so gradients are evaluated OUTSIDE the feasible box. Under sign(grad)
+        # the endpoint is start + step * sum_t sign(grad_t) clamped, so a
+        # coordinate pushing consistently outward still finishes on the wall;
+        # what changes is the trajectory the gradients were read along.
+        self.clamp_mode = "step"
         self.step_size = step_size
         self.random_start = random_start
         self.restarts = max(int(restarts), 1)
@@ -458,15 +468,50 @@ class PGDMutation(GradientMutation):
         # Ensure start in-bounds
         x_adv = torch.max(torch.min(x_adv, x_high), x_low).detach()
 
-        for _ in range(self.num_steps):
+        # Wall recycling bookkeeping; costs nothing when disabled.
+        streak = (torch.zeros_like(x_adv, dtype=torch.long)
+                  if self.wall_recycle > 0 else None)
+        tol = 1e-12
+
+        for t in range(self.num_steps):
             grad = self.input_gradient(x_adv, model, rows)
 
             # Gradient ascent on loss
-            x_adv = (x_adv + step_size * torch.sign(grad)).detach()
+            raw = (x_adv + step_size * torch.sign(grad)).detach()
 
             # Project back to feasible box
-            x_adv = torch.max(torch.min(x_adv, x_high), x_low).detach()
+            x_adv = (raw.detach() if self.clamp_mode == "final"
+                     else torch.max(torch.min(raw, x_high), x_low).detach())
 
+            if streak is not None:
+                # Under sign(grad) every coordinate moves a full step, so any
+                # coordinate whose gradient sign is stable reaches a wall in
+                # num_steps steps and the clamp then holds it there for the
+                # rest of the run: measured on the ERAN nets, 94-100% of the
+                # 784 input dimensions end pinned and a pinned one is released
+                # 0.02-0.19 times on average. Those dimensions contribute
+                # nothing further, so the ascent finishes on a corner.
+                #
+                # Pull a coordinate the clamp has bitten `wall_recycle`
+                # consecutive times back to exactly `remaining * step_size`
+                # from its wall. The distance is chosen so a coordinate still
+                # pushing outward walks back to the same wall on the final
+                # step -- the endpoint is unchanged in that case, and the room
+                # is used only if the gradient sign reverses.
+                bit = (raw > x_high + tol) | (raw < x_low - tol)
+                streak = torch.where(bit, streak + 1, torch.zeros_like(streak))
+                due = streak >= self.wall_recycle
+                if bool(due.any()):
+                    back = float(self.num_steps - (t + 1)) * step_size
+                    x_adv = torch.where(due & (x_adv >= x_high - tol),
+                                        x_high - back, x_adv)
+                    x_adv = torch.where(due & (x_adv <= x_low + tol),
+                                        x_low + back, x_adv)
+                    x_adv = torch.max(torch.min(x_adv, x_high), x_low).detach()
+                    streak = torch.where(due, torch.zeros_like(streak), streak)
+
+        if self.clamp_mode == "final":
+            x_adv = torch.max(torch.min(x_adv, x_high), x_low)
         return x_adv.detach()
 
     def mutate(self, input_tensor, model, activations=None, rows=None):
@@ -526,10 +571,32 @@ class PGDMutation(GradientMutation):
         return best_x
 
 
-def _relu_preactivations_batched(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Concatenated ReLU pre-activation values [B, N] across every ReLU
-    layer in module-registration order. Keeps the autograd graph (used for
-    the hinge-loss gradient in HPGDMutation)."""
+# The state coordinate system is the pre-activation of every scalar activation
+# in the graph, not only ReLU. Sigmoid and Tanh split at their inflection point
+# the way ReLU splits at its kink, so the same sign pattern, the same hinge
+# projection and the same novelty bookkeeping carry over unchanged -- what does
+# NOT carry over is the reading: a sign flip is a change of linear piece for
+# ReLU, but only a change of curvature side for the smooth ones.
+_ACTIVATION_FN_NAMES = frozenset({"relu", "sigmoid", "tanh"})
+
+
+def _is_activation_module(module: nn.Module) -> bool:
+    """Whether this module is one of the scalar activations the state is built
+    on. onnx2torch does NOT emit nn.Tanh for an ONNX Tanh -- it emits an
+    OnnxFunction wrapper holding torch.tanh -- so an isinstance test alone
+    silently finds nothing on ONNX-sourced Tanh graphs (every ERAN tanh net,
+    for one) and the caller sees "model has no activation layers" or, worse,
+    an empty pattern."""
+    if isinstance(module, (nn.ReLU, nn.Sigmoid, nn.Tanh)):
+        return True
+    fn = getattr(module, "function", None)  # onnx2torch's OnnxFunction wrapper
+    return callable(fn) and getattr(fn, "__name__", "") in _ACTIVATION_FN_NAMES
+
+
+def _activation_preactivations_batched(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Concatenated activation pre-activation values [B, N] across every
+    ReLU/Sigmoid/Tanh layer in module-registration order. Keeps the autograd
+    graph (used for the hinge-loss gradient in HPGDMutation)."""
     preacts: List[torch.Tensor] = []
     handles = []
 
@@ -538,7 +605,7 @@ def _relu_preactivations_batched(model: nn.Module, x: torch.Tensor) -> torch.Ten
             preacts.append(inputs[0])
 
     for module in model.modules():
-        if isinstance(module, nn.ReLU):
+        if _is_activation_module(module):
             handles.append(module.register_forward_pre_hook(hook))
     try:
         model(x)
@@ -546,15 +613,32 @@ def _relu_preactivations_batched(model: nn.Module, x: torch.Tensor) -> torch.Ten
         for handle in handles:
             handle.remove()
     if not preacts:
-        raise RuntimeError("Model has no ReLU layers reachable from a forward pass on this input.")
+        raise RuntimeError(
+            "Model has no ReLU/Sigmoid/Tanh layers reachable from a forward pass "
+            "on this input."
+        )
     return torch.cat([z.flatten(start_dim=1) for z in preacts], dim=1)
 
 
-def _relu_sign_pattern_batched(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Concrete ReLU pre-activation sign pattern (+-1) [B, N], no grad."""
+def _activation_sign_pattern_batched(model: nn.Module, x: torch.Tensor,
+                                     binning=None) -> torch.Tensor:
+    """Concrete pre-activation state code (+-1) [B, M], no grad.
+
+    `binning` (act.pipeline.fuzzing.state_bins.StateBinning) chooses how a
+    pre-activation becomes a code. None keeps the two-bin `sign(z)` this was
+    born as, so M == N and every existing caller is unaffected; a three-bin
+    binning returns M == 2N coordinates split at z = -tau, +tau.
+    """
     with torch.no_grad():
-        z = _relu_preactivations_batched(model, x)
+        z = _activation_preactivations_batched(model, x)
+    if binning is not None:
+        return binning.code(z)
     return torch.where(z > 0, torch.ones_like(z), -torch.ones_like(z))
+
+
+# Kept so callers written against the ReLU-only version keep working.
+_relu_preactivations_batched = _activation_preactivations_batched
+_relu_sign_pattern_batched = _activation_sign_pattern_batched
 
 
 class HPGDMutation(MutationStrategy):
@@ -575,6 +659,11 @@ class HPGDMutation(MutationStrategy):
     projection still applies afterward like every other strategy.
 
     Flip-candidate selection:
+      - `flip_frac` (optional attribute, settable after construction): when
+        set, the flip budget becomes ``round(flip_frac * len(candidates))``
+        instead of the fixed `flip_count`, so the displacement stays a
+        constant share of the flippable subspace across networks whose
+        unstable sets differ by an order of magnitude.
       - `candidate_indices` (optional): restrict which neurons are eligible
         to flip (e.g. only the instance's unstable ReLUs, from
         act.pipeline.fuzzing.state_manager.compute_unstable_mask). None =
@@ -613,7 +702,8 @@ class HPGDMutation(MutationStrategy):
 
         Args:
             perturb_size: L_infinity radius of the local feasible box around the seed (scalar or per-dimension tensor)
-            flip_count: Number of ReLU neurons to flip away from the seed's own natural pattern, per sample
+            flip_count: Number of ReLU neurons to flip away from the seed's own natural
+                pattern, per sample. Overridden by the `flip_frac` attribute when set.
             num_steps: Number of hinge-loss sign-gradient steps
             step_size: Per-step size (if None, computed from the feasible box range / steps)
             margin: Hinge-loss margin -- a neuron counts as "matching" the target once its
@@ -623,6 +713,13 @@ class HPGDMutation(MutationStrategy):
         """
         self.perturb_size = perturb_size
         self.flip_count = int(flip_count)
+        # Optional: size the flip budget as a FRACTION of the candidate set
+        # instead of a fixed count. A fixed 10 means very different things
+        # across networks -- 10 of safenlp's 93 unstable neurons is 10.8% of
+        # the flippable subspace, 10 of a cifar100 ResNet's 3225 is 0.31% --
+        # so a fixed count silently compares a large displacement against a
+        # tiny one. None (default) keeps the fixed `flip_count`.
+        self.flip_frac: Optional[float] = None
         self.num_steps = int(num_steps)
         self.step_size = step_size
         self.margin = float(margin)
@@ -639,6 +736,48 @@ class HPGDMutation(MutationStrategy):
         # it equivalent to "target_only".
         self.hold_still_weight = float(hold_still_weight)
         self.flip_weights: Optional[torch.Tensor] = None
+        # How a three-segment target picks its destination: "adjacent" moves
+        # one segment (the smallest code change), "any" picks either of the two
+        # segments the neuron is not in, which is what makes high -> low
+        # askable. Ignored when the state is two-bin.
+        self.bin_move = "adjacent"
+        # StateBinning for the code this aims at; None = two-bin sign(z).
+        # Set by ACTFuzzer alongside candidate_indices, since both describe the
+        # same coordinate system and must agree.
+        self.binning = None
+        # Explicit target: when set to a [B, num_neurons] sign tensor, this
+        # call aims at THAT pattern instead of building one by flipping k
+        # random bits. A target assembled by flipping k bits independently
+        # names a sign assignment that may well be infeasible -- an empty
+        # polytope -- and measurement says that is what happens: ~15% of the
+        # asked flips land, 0% exactly, and the projection ends farther from
+        # its own target than it started. Naming a feasible target instead
+        # (PatternStateManager.propose_targets, wired by ACTFuzzer under
+        # hpgd_target_mode="interp_real") is reached exactly ~95-97% of the
+        # time. Ignored if its batch dim does not match the input's, so a
+        # stale target from another batch cannot silently steer this one.
+        # None (default) keeps the random-flip behaviour.
+        self.target_override: Optional[torch.Tensor] = None
+        # [B] bool: which lanes actually use `target_override`. Lanes outside
+        # it fall back to this call's own random flips, so one batch can carry
+        # both roles -- the coarse-to-fine schedule needs some lanes expanding
+        # the frontier by brute displacement while others navigate precisely
+        # inside it. None = every lane uses the override.
+        self.target_override_mask: Optional[torch.Tensor] = None
+        # [B] int: per-lane flip budget for the lanes NOT using an override.
+        # None = the scalar flip_count/flip_frac for the whole batch.
+        self.flip_counts: Optional[torch.Tensor] = None
+        # Lazy alternative to setting the three seams above by hand:
+        # natural_pattern [B, N] -> (target [B, N] | None, mask [B] | None,
+        # flip_counts [B] | None). Called from inside mutate(), which matters
+        # because MutationEngine samples ONE strategy per iteration
+        # (mutations.py: strategy_name = np.random.choice(...)): HPGD runs on
+        # only its share of iterations, so computing targets eagerly every
+        # iteration pays for the ~2/3 that dispatch elsewhere. Measured on
+        # cifar100_2024, doing it eagerly cost 21% of the iteration budget --
+        # enough to lose an A/B for a reason that has nothing to do with the
+        # mechanism under test.
+        self.target_proposer = None
         self.last_natural_pattern: Optional[torch.Tensor] = None
         self.last_achieved_pattern: Optional[torch.Tensor] = None
         self.last_target_pattern: Optional[torch.Tensor] = None
@@ -661,7 +800,8 @@ class HPGDMutation(MutationStrategy):
         B = x0.shape[0]
         device = x0.device
 
-        natural_pattern = _relu_sign_pattern_batched(model, x0)
+        binning = self.binning
+        natural_pattern = _relu_sign_pattern_batched(model, x0, binning=binning)
         num_neurons = natural_pattern.shape[1]
         candidates = (
             self.candidate_indices.to(device) if self.candidate_indices is not None
@@ -669,20 +809,88 @@ class HPGDMutation(MutationStrategy):
         )
         C = candidates.numel()
 
-        target_pattern = natural_pattern.clone()
-        k = min(self.flip_count, C)
-        if k > 0:
-            if self.flip_weights is not None:
-                weights = self.flip_weights.to(device)
-                if weights.dim() == 1:
-                    weights = weights.unsqueeze(0).expand(B, -1)
-                for b in range(B):
-                    local_idx = torch.multinomial(weights[b].clamp(min=1e-8), k, replacement=False)
-                    target_pattern[b, candidates[local_idx]] *= -1
+        if self.target_proposer is not None:
+            proposed, mask, counts = self.target_proposer(natural_pattern)
+            self.target_override = proposed
+            self.target_override_mask = mask
+            self.flip_counts = counts
+
+        override = self.target_override
+        if override is not None and override.shape[0] != B:
+            override = None  # belongs to a different batch; do not steer with it
+        use_override = torch.zeros(B, dtype=torch.bool, device=device)
+        if override is not None:
+            mask = self.target_override_mask
+            if mask is not None and mask.shape[0] == B:
+                use_override = mask.to(device).bool()
             else:
-                for b in range(B):
-                    local_idx = torch.randperm(C, device=device)[:k]
-                    target_pattern[b, candidates[local_idx]] *= -1
+                use_override[:] = True
+
+        target_pattern = natural_pattern.clone()
+        if override is not None and bool(use_override.any()):
+            ov = override.to(device).to(natural_pattern.dtype)
+            rows = use_override.nonzero(as_tuple=True)[0]
+            target_pattern[rows] = ov[rows]
+
+        if self.flip_frac is not None:
+            k = min(max(1, int(round(float(self.flip_frac) * C))), C)
+        else:
+            k = min(self.flip_count, C)
+        # Per-lane budget wins over the batch-wide one when supplied.
+        counts = None
+        if self.flip_counts is not None and self.flip_counts.shape[0] == B:
+            counts = self.flip_counts.to(device).clamp(min=0, max=C)
+
+        weights = None
+        if self.flip_weights is not None:
+            weights = self.flip_weights.to(device)
+            if weights.dim() == 1:
+                weights = weights.unsqueeze(0).expand(B, -1)
+        for b in range(B):
+            if bool(use_override[b]):
+                continue  # this lane's target was named for it
+            k_b = int(counts[b]) if counts is not None else k
+            if k_b <= 0:
+                continue
+            if weights is not None:
+                local_idx = torch.multinomial(weights[b].clamp(min=1e-8), k_b, replacement=False)
+            else:
+                local_idx = torch.randperm(C, device=device)[:k_b]
+            if binning is not None and binning.bins != 2:
+                # Segment granularity, not coordinate granularity. Flipping one
+                # coordinate of a three-segment code is not a well-defined move:
+                # two of the six possible single flips are a no-op or a
+                # two-segment jump, and "high -> low" cannot be named at all.
+                # So pick the NEURONS behind the drawn coordinates and name a
+                # destination segment for each.
+                neurons = torch.unique(
+                    binning.neuron_index_of_coord(candidates[local_idx]))
+                cur = binning.bin_of(target_pattern[b])[neurons]
+                if self.bin_move == "adjacent":
+                    # +-1 segment, clamped -- the smallest move that changes
+                    # the code, and the only one a single hinge wall has to be
+                    # crossed for.
+                    step = torch.where(torch.rand_like(cur.float()) < 0.5, -1, 1)
+                    dest = (cur + step).clamp(binning.LOW, binning.HIGH)
+                    # A clamp can land back on `cur` at the ends; send those the
+                    # other way so every drawn neuron actually moves.
+                    stuck = dest == cur
+                    dest[stuck] = (cur[stuck] - step[stuck]).clamp(
+                        binning.LOW, binning.HIGH)
+                else:  # "any": uniform over the two segments it is not in
+                    offset = torch.randint(1, binning.HIGH + 1, cur.shape,
+                                           device=cur.device)
+                    dest = (cur + offset) % (binning.HIGH + 1)
+                binning.write_bin(target_pattern,
+                                  torch.full_like(neurons, b), neurons, dest)
+            else:
+                target_pattern[b, candidates[local_idx]] *= -1
+        if binning is not None:
+            # Independent per-coordinate flips can name (-1, +1), which asks a
+            # neuron to be below -tau and above +tau at once. Aiming at an
+            # infeasible target is already the documented reason a projection
+            # lands nowhere, so project onto the reachable set first.
+            target_pattern = binning.repair(target_pattern)
 
         perturb_size = self.perturb_size.to(device) if isinstance(self.perturb_size, torch.Tensor) else self.perturb_size
         x_low = x0 - perturb_size
@@ -707,15 +915,19 @@ class HPGDMutation(MutationStrategy):
         for _ in range(self.num_steps):
             x_req = x.detach().clone().requires_grad_(True)
             z_all = _relu_preactivations_batched(model, x_req)
-            # Hinge loss: penalize any neuron whose signed pre-activation hasn't
-            # cleared `margin` in the target's direction yet.
-            violation = (self.margin - target_pattern * z_all).clamp(min=0)
+            # Hinge loss: penalize any coordinate whose signed pre-activation
+            # hasn't cleared `margin` in the target's direction yet. Under a
+            # three-bin state the coordinate is `z - tau` rather than `z`, so
+            # the same hinge drives the neuron across a bin wall instead of
+            # across zero -- the projection itself is unchanged.
+            z_coords = binning.shifted(z_all) if binning is not None else z_all
+            violation = (self.margin - target_pattern * z_coords).clamp(min=0)
             loss = (violation * term_weight).sum()
             grad = torch.autograd.grad(loss, x_req, retain_graph=False, create_graph=False)[0].detach()
             x = (x_req.detach() - step_size * torch.sign(grad)).detach()
             x = torch.max(torch.min(x, x_high), x_low).detach()
 
-        achieved_pattern = _relu_sign_pattern_batched(model, x)
+        achieved_pattern = _relu_sign_pattern_batched(model, x, binning=binning)
         self.last_natural_pattern = natural_pattern
         self.last_achieved_pattern = achieved_pattern
         # Kept so a caller can ask what this call was AIMING at, not just where
@@ -774,8 +986,10 @@ class HPGDCoverageMutation(MutationStrategy):
             perturb_size: L_infinity radius of the local feasible box around the seed
             target_count: Number of never-activated neurons each sample chases per call
                 (drawn independently per sample, so a B-sample batch explores up to
-                B*target_count distinct uncovered neurons in one iteration). Ignored
-                when nearest_margin=True (always exactly 1 target/sample then).
+                B*target_count distinct uncovered neurons in one iteration). Honoured
+                under nearest_margin=True too -- it then takes the top `target_count`
+                by closeness-to-firing, so the two selection rules stay comparable at
+                a matched target count.
             num_steps: Number of hinge-loss sign-gradient steps
             step_size: Per-step size (if None, derived from the feasible box range / steps)
             margin: Hinge-loss target -- a neuron counts as "fired" once |activation|
@@ -792,9 +1006,9 @@ class HPGDCoverageMutation(MutationStrategy):
                 RANDOM from the whole uncovered pool, independent of whether they're
                 anywhere near reachable from this sample's current position. True =
                 for each sample, run one extra no-grad forward pass on its current
-                (unmutated) input and pick the SINGLE uncovered neuron whose current
-                |activation| is closest to `margin` from below (i.e. needs the
-                smallest push to fire) as that sample's lone target. This stays in
+                (unmutated) input and pick the target_count uncovered neurons whose
+                current |activation| is closest to `margin` from below (i.e. need the
+                smallest push to fire) as that sample's targets. This stays in
                 the exact same tensor space the hinge loss/CoverageTracker itself
                 measures (Conv2d/Linear/ReLU module OUTPUT, not ReLU pre-activation --
                 see the class docstring for why those differ across a BatchNorm), so
@@ -858,12 +1072,19 @@ class HPGDCoverageMutation(MutationStrategy):
                 handle.remove()
         return captured
 
-    def _nearest_margin_targets(self, x0, model, uncovered_list):
-        """For each sample in x0, pick the single uncovered neuron whose CURRENT
+    def _nearest_margin_targets(self, x0, model, uncovered_list, k: int = 1):
+        """For each sample in x0, pick the `k` uncovered neurons whose CURRENT
         |activation| (at x0, before any mutation) is closest to `margin` from
-        below -- i.e. needs the smallest push to fire. One extra no-grad forward
+        below -- i.e. need the smallest push to fire. One extra no-grad forward
         pass on the unmutated seed; ranking stays in CoverageTracker's own
-        output-hooked tensor space (see nearest_margin's docstring above)."""
+        output-hooked tensor space (see nearest_margin's docstring above).
+
+        `k` exists so this can be compared against the uniform-random path at a
+        MATCHED target count. This used to be hardwired to a single target while
+        the random path drew `target_count` of them, so the two arms differed in
+        HOW MANY neurons they chased as well as in HOW those were chosen, and
+        neither difference could be attributed on its own.
+        """
         B = x0.shape[0]
         device = x0.device
 
@@ -874,31 +1095,33 @@ class HPGDCoverageMutation(MutationStrategy):
         with torch.no_grad():
             captured0 = self._hooked_forward(model, x0)
 
-        best_val = torch.full((B,), -1.0, device=device)
-        best_target: List[Optional[Tuple[str, int]]] = [None] * B
-
+        # One (B, M) score matrix over every uncovered neuron this forward pass
+        # actually produced, with a parallel column -> (layer, idx) key list, so
+        # the top-k ranking is global instead of per-layer.
+        cols: List[torch.Tensor] = []
+        keys: List[Tuple[str, int]] = []
         for layer_name, indices in uncovered_by_layer.items():
             raw = captured0.get(layer_name)
             if raw is None:
                 continue
             mat = _activation_to_neuron_matrix(raw)
+            if mat.numel() == 0:
+                continue
             idx_tensor = torch.tensor(indices, device=mat.device).clamp(max=mat.shape[1] - 1)
-            vals = mat[:, idx_tensor].abs()
-            layer_best_val, layer_best_pos = vals.max(dim=1)
-            # Highest |activation| among the still-uncovered = closest to firing.
-            improved = (layer_best_val > best_val).tolist()
-            layer_best_val_list = layer_best_val.tolist()
-            layer_best_pos_list = layer_best_pos.tolist()
-            for b, did_improve in enumerate(improved):
-                if not did_improve:
-                    continue
-                best_val[b] = layer_best_val_list[b]
-                best_target[b] = (layer_name, indices[layer_best_pos_list[b]])
+            cols.append(mat[:, idx_tensor].abs().to(device))
+            keys.extend((layer_name, i) for i in indices)
 
         # A sample whose every uncovered neuron sat in a layer this forward pass
         # never produced still needs a target; give it a random one.
         fallback = uncovered_list[torch.randint(len(uncovered_list), (1,)).item()]
-        return [[t] if t is not None else [fallback] for t in best_target]
+        if not cols:
+            return [[fallback] for _ in range(B)]
+
+        scores = torch.cat(cols, dim=1)
+        kk = max(1, min(int(k), scores.shape[1]))
+        # Highest |activation| among the still-uncovered = closest to firing.
+        top = scores.topk(kk, dim=1).indices.tolist()
+        return [[keys[j] for j in row] for row in top]
 
     def mutate(self, input_tensor, model, activations=None, rows=None):
         """Apply HPGD-Cov mutation.
@@ -957,7 +1180,9 @@ class HPGDCoverageMutation(MutationStrategy):
 
         uncovered_list = list(uncovered)
         if self.nearest_margin:
-            per_sample_targets = self._nearest_margin_targets(x0, model, uncovered_list)
+            per_sample_targets = self._nearest_margin_targets(
+                x0, model, uncovered_list, k=self.target_count
+            )
         else:
             k = min(self.target_count, len(uncovered_list))
             per_sample_targets = [

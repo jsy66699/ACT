@@ -1,0 +1,39 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# AutoAttackPGD Configuration (4-stage ablation baseline)
+# ═══════════════════════════════════════════════════════════════════════════
+# Custom, box-respecting reimplementation of the AutoAttack ensemble
+# (APGD-CE -> APGD-T -> simplified FAB-T -> simplified Square Attack).
+#
+# Precedence:  CLI flag  >  this file  >  code default
+#
+# Point category/max_instances/instance_index/model_index at the same
+# instance as pattern_search_pgd.yaml / random_start_pgd.yaml for an
+# apples-to-apples comparison across all three methods.
+
+category: "cifar100_2024"
+max_instances: 1
+instance_index: 11
+model_index: 0
+
+# Number of independent full 4-stage pipeline attempts (each stage's own
+# internal restarts/target-classes/queries are controlled separately below).
+restarts: 1
+
+# Print progress every N restarts/queries (0 = silent).
+report_interval: 1
+
+# ---- Stage 1 (APGD-CE) / Stage 2 (APGD-T) ----
+# Auto-PGD iterations per call (momentum + adaptive step-size halving).
+apgd_steps: 100
+# Random-init restarts per APGD-CE call and per APGD-T target class.
+apgd_restarts: 2
+# How many top (by clean-point logit) other classes APGD-T/FAB-T target.
+n_target_classes: 5
+
+# ---- Stage 3 (FAB-T, simplified) ----
+fab_steps: 30
+# Fraction to overshoot past the linearized decision boundary each step.
+fab_bias: 0.10
+
+# ---- Stage 4 (Square Attack, simplified) ----
+square_queries: 500

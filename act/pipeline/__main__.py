@@ -16,7 +16,6 @@ Usage:
     
     # Fuzz with custom device/dtype
     python -m act.pipeline --fuzz --category acasxu_2023 --device cpu --dtype float32
-
 Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
 """

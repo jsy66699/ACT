@@ -264,7 +264,8 @@ class BaseSpecCreator(ABC):
     def _get_model_io_shapes(
         self,
         model: torch.nn.Module,
-        sample_input: torch.Tensor
+        sample_input: torch.Tensor,
+        model_batch_size: int = 1
     ) -> Tuple[torch.Size, torch.Size]:
         """
         Get model input and output shapes by running inference.
@@ -278,11 +279,22 @@ class BaseSpecCreator(ABC):
         """
         model.eval()
         with torch.no_grad():
-            # sample_input already has batch dimension (1, C, H, W)
+            # sample_input already has batch dimension (1, C, H, W).
+            # A graph converted with a pinned batch (attention graphs, whose
+            # Reshapes fold the batch into the token axis) only runs at that
+            # batch, so the FORWARD is widened to it -- but the shape reported
+            # back stays per-sample, because the specs being validated against
+            # it are per-instance and would otherwise be rejected for having
+            # one row instead of `model_batch_size`.
             test_input = sample_input
+            if model_batch_size > 1 and test_input.shape[0] == 1:
+                test_input = test_input.expand(model_batch_size, *test_input.shape[1:])
             output = model(test_input)
-        
-        return sample_input.shape, output.shape
+
+        out_shape = output.shape
+        if model_batch_size > 1 and out_shape and out_shape[0] == model_batch_size:
+            out_shape = torch.Size((1,) + tuple(out_shape[1:]))
+        return sample_input.shape, out_shape
     
     def _validate_input_spec_shape(
         self,
@@ -344,7 +356,8 @@ class BaseSpecCreator(ABC):
         input_spec: InputSpec,
         output_spec: OutputSpec,
         model: torch.nn.Module,
-        sample_input: torch.Tensor
+        sample_input: torch.Tensor,
+        model_batch_size: int = 1
     ) -> Tuple[bool, List[str]]:
         """
         Comprehensive validation: spec shapes match model I/O.
@@ -356,7 +369,8 @@ class BaseSpecCreator(ABC):
         
         # Get model I/O shapes
         try:
-            input_shape, output_shape = self._get_model_io_shapes(model, sample_input)
+            input_shape, output_shape = self._get_model_io_shapes(
+                model, sample_input, model_batch_size)
             # Assume last dimension is classes for classification
             if len(output_shape) > 1:
                 num_classes = output_shape[-1]
@@ -382,14 +396,16 @@ class BaseSpecCreator(ABC):
         self,
         spec_pairs: List[Tuple[InputSpec, OutputSpec]],
         pytorch_model: torch.nn.Module,
-        sample_input: torch.Tensor
+        sample_input: torch.Tensor,
+        model_batch_size: int = 1
     ) -> List[Tuple[InputSpec, OutputSpec]]:
         """Validate spec pairs against model and filter invalid ones."""
         valid_pairs = []
         for input_spec, output_spec in spec_pairs:
             try:
                 is_valid, errors = self.validate_spec_pair_with_model(
-                    input_spec, output_spec, pytorch_model, sample_input
+                    input_spec, output_spec, pytorch_model, sample_input,
+                    model_batch_size
                 )
                 if is_valid:
                     valid_pairs.append((input_spec, output_spec))
