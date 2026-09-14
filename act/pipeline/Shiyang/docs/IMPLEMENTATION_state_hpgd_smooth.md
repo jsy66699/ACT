@@ -165,7 +165,7 @@ _relu_sign_pattern_batched    = _activation_sign_pattern_batched
 |---|---|---|
 | `compute_unstable_mask(model, lb, ub, scope, binning)` | 区间传播（IBP）：`binning.expand_bounds(lb,ub)`，即盒子是否跨过该坐标的墙 | 默认 |
 | `compute_per_instance_masks(...)` | 同上，但**每行是该实例自己的集合**，不做并集 | `--unstable-mask per_instance` |
-| `compute_gradient_budget_masks(..., threshold)` | 盒子的一阶梯度预算 `ε·‖dz/dx‖₁` 够不够到墙 | `--unstable-mask-source gradient` |
+| `compute_gradient_budget_masks(..., threshold)` | 盒子的一阶梯度预算 `ε·‖dz/dx‖₁` 够不够到墙 | `--unstable-mask-source gradient`（**本次实验没用它跑过**，见下） |
 
 `scope` 三档（`--unstable-mask`）：
 
@@ -174,13 +174,24 @@ _relu_sign_pattern_batched    = _activation_sign_pattern_batched
 * `union` —— 所有行的盒子取或，是每条 lane 自己集合的真超集。
 * `per_instance` —— 每条 lane 一行。
 
-两者的做法不同：区间传播把输入盒逐层传播，得到每个神经元的区间 `[lbⱼ, ubⱼ]`；梯度预算
-只在盒中心做一次 forward 和逐神经元一次 backward，用 `|z(x₀) − 墙| ≤ ε·‖∂z/∂x‖₁` 判断。
-后者存在的理由是**区间传播的误差在注意力图上会相乘放大**（`vit_2023` 返回 960/960 全不稳定、
-宽度 1e12 而真实可达宽度 0.10 —— 这个答案不携带任何信息；梯度预算返回 74/960，耗时 0.9 s）。
-在 ERAN 上它把 IBP 的 355/600 收紧到 24/600（2-bin）/ 54/600（3-bin）。
+### 3.1 梯度预算：本次实验只把它当**测量口径**，没有当运行掩码
 
-这个掩码**只用来挑攻击目标**，不进入任何验证结论，所以这里选的是精度而不是保守性。
+**所有 arm 跑的都是默认的区间传播。** 梯度预算在这里只用来回答一个问题：
+「一个神经元的墙，盒子到底够不够得着？」
+
+两者做法不同。区间传播把输入盒逐层传播，给每个神经元一个区间 `[lbⱼ, ubⱼ]`，跨过墙就算候选；
+梯度预算只在盒中心做一次 forward 和逐神经元一次 backward，比较
+
+```
+|z(x₀) − 墙|   与   ε·‖∂z/∂x‖₁      （L∞ 盒对梯度的支撑函数）
+```
+
+在 ERAN sigmoid 6×100 上两个口径差得很远：**IBP 355/600，梯度预算 24/600**。
+
+这个差距本身就是实验结论之一：候选集里约 331 个坐标是**死的**，IBP 只是不能排除它们。
+「状态码几乎恒定、准入几乎永远说见过」的直接原因就在这。所以**下一个杠杆是候选判据，
+不是 τ** —— 把运行时的掩码从 IBP 换成梯度预算，候选集才会反映攻击真正付得起的那部分。
+这一步还没做。
 
 ---
 
