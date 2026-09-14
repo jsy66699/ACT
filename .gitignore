@@ -36,3 +36,6 @@ act/pipeline/Shiyang/act/
 # Scratch outputs from the analysis scripts.
 act/pipeline/Shiyang/configs/*.tmp
 .idea/
+# 未入库的文档草稿与大图（本地保留）
+act/pipeline/Shiyang/docs/PPT_BRIEF_*.md
+act/pipeline/Shiyang/docs/*.png

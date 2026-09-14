@@ -98,7 +98,7 @@ NOTES: list[tuple[str, str, str]] = [
     (r"^act/pipeline/Shiyang/results/.*\.sh$", "实验代码（纯新增）",
      "启动 campaign 的 shell 脚本（`results/` 其余内容不入库）。"),
     (r"^act/pipeline/Shiyang/(README|docs/)", "文档（纯新增）",
-     "实验入口、参数说明、实验日志、(D,S) 指标推导。"),
+     "实验入口、实现说明、参数说明、与 main 的差异、实验日志、(D,S) 指标推导。"),
     (r"^ACT_PIPELINE_HELP\.md$", "文档（纯新增）",
      "`python -m act.pipeline --help` 的 Markdown 版。"),
 
