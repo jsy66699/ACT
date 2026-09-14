@@ -2,15 +2,24 @@
 
 The ReLU state is `sign(z)`: one bit per neuron, split at the kink.  Ported
 verbatim to Sigmoid/Tanh that bit splits at the inflection point instead, and
-measured on the ERAN nets it is nearly constant inside a verification box --
-pre-activations sit at |z| ~ 3.5-22 while the only boundary is at 0, so almost
-no neuron can reach it and the "state" barely varies.
+measured on the ERAN nets it is nearly constant inside a verification box.
+
+The reason is the box, not the magnitude of z.  Re-measured at the box centres
+of 20 instances, |z| is NOT uniformly large -- per-LAYER medians run 3.3-22.7
+(an earlier version of this docstring quoted that range as if it were the range
+of |z| itself, which was wrong), but individual pre-activations go down to
+0.002, and 8.6% of (instance, neuron) pairs on sigmoid sit within 1.0 of the
+sign wall.  What is small is the budget: at eps=0.015 the box can only move a
+pre-activation so far, and only ~4% of neurons have their sign wall inside that
+budget, so the "state" barely varies.
 
 A three-way split at `z = -tau, +tau` gives those neurons a boundary they can
 actually reach.  Measured on ERAN 6x100 (a wall counts when it lies within the
-box's first-order budget for moving that pre-activation): sigmoid 24/600
-neurons under the sign partition against 54/600 under this one, tanh 20/600
-against 40/600 -- 2.0-2.3x more reachable walls.
+box's first-order budget for moving that pre-activation), on INSTANCE 0 of each
+net: sigmoid 24/600 neurons under the sign partition against 54/600 under this
+one, tanh 20/600 against 40/600.  These are one instance, not an average --
+across the first five instances the counts run 17-52 (sign) against 39-91
+(+-tau), but the RATIO is stable at 1.75-2.4x more reachable walls.
 
 Note that three segments means exactly TWO walls, so the sign wall at 0 is
 GONE: this is a different partition, not a refinement of the sign one. On these
