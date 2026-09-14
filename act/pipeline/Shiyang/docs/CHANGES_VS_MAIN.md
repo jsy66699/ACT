@@ -4,6 +4,10 @@
 `python act/pipeline/Shiyang/docs/gen_changes_doc.py` 从**真实的 diff** 生成，
 改动了却没写理由的文件会让脚本报错退出，所以这张表不会漏。
 
+> 表里 `CHANGES_VS_MAIN.md` 自己那一行的行数会比实际少几行 —— 它统计的是**生成之前**的自己，这是自指文档的固定点问题，不影响其它任何数字。
+
+> 想看**每个文件展开的中文说明**（修改的上游文件改了什么、新增的每个文件干什么），看 [`FILE_REFERENCE.md`](FILE_REFERENCE.md)。
+
 ```bash
 # 重新生成（默认对比 origin/main）
 python act/pipeline/Shiyang/docs/gen_changes_doc.py
@@ -14,9 +18,9 @@ python act/pipeline/Shiyang/docs/gen_changes_doc.py --base upstream/main --head 
 | | |
 |---|---|
 | 对比基准 | `origin/main` at `e9ed992` |
-| 相差 commit | 20 |
-| 改动文件 | 58（新增 45 · 修改 12 · 删除 1） |
-| 行数 | +14,563 / −216 |
+| 相差 commit | 22 |
+| 改动文件 | 61（新增 48 · 修改 12 · 删除 1） |
+| 行数 | +15,370 / −216 |
 | 改动的**上游**文件 | 12，其中在默认参数下就生效的只有 1 个（`torch2act.py`，见下） |
 <!-- END SUMMARY -->
 
@@ -127,17 +131,20 @@ git diff origin/main -- act/pipeline/fuzzing/actfuzzer.py | grep -E "^\+ +[a-z_]
 | `act/pipeline/Shiyang/results/verify_safenlp_isolate.sh` | 新增 | +48 / −0 | 启动 campaign 的 shell 脚本（`results/` 其余内容不入库）。 |
 | `act/pipeline/Shiyang/pipeline/summarize_state_ab.py` | 新增 | +44 / −0 | 分析/探针脚本，每个的完整说明在它自己的模块 docstring 里。 |
 
-### 文档（纯新增）　　<sub>7 个文件 · +3,085 / −0</sub>
+### 文档（纯新增）　　<sub>10 个文件 · +3,892 / −0</sub>
 
 | 文件 | | 行数 | 为什么 |
 |---|---|---|---|
 | `act/pipeline/Shiyang/docs/EXPERIMENT_LOG_20260827_28.md` | 新增 | +1,847 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
+| `act/pipeline/Shiyang/docs/FILE_REFERENCE.md` | 新增 | +383 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
 | `act/pipeline/Shiyang/docs/CE_DIVERSITY_METRIC.md` | 新增 | +343 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
 | `act/pipeline/Shiyang/docs/EXPERIMENT_LOG_20260909_smooth_state.md` | 新增 | +242 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
+| `act/pipeline/Shiyang/docs/gen_changes_doc.py` | 新增 | +217 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
+| `act/pipeline/Shiyang/docs/CHANGES_VS_MAIN.md` | 新增 | +205 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
 | `act/pipeline/Shiyang/docs/PARAMETERS.md` | 新增 | +199 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
 | `ACT_PIPELINE_HELP.md` | 新增 | +194 / −0 | `python -m act.pipeline --help` 的 Markdown 版。 |
 | `act/pipeline/Shiyang/docs/gen_parameters_doc.py` | 新增 | +150 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
-| `act/pipeline/Shiyang/README.md` | 新增 | +110 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
+| `act/pipeline/Shiyang/README.md` | 新增 | +112 / −0 | 实验入口、参数说明、实验日志、(D,S) 指标推导。 |
 
 ### benchmark 工具（纯新增）　　<sub>8 个文件 · +583 / −0</sub>
 
@@ -188,6 +195,8 @@ git diff origin/main -- act/pipeline/fuzzing/actfuzzer.py | grep -E "^\+ +[a-z_]
 | `765964c` | 2026-08-26 | feat(batch-ani): --repeat, and the cifar100 counterpart of the safenlp campaign |
 | `7a29a94` | 2026-09-11 | Merge origin/main into shiyang-fuzzing-research |
 | `fe8d4c4` | 2026-09-14 | chore: slim experiment branch -- code, scripts and docs only |
+| `e4253fe` | 2026-09-14 | docs: explain every difference from upstream main, and generate it from the diff |
+| `c1ee16f` | 2026-09-14 | docs: file-by-file reference in Chinese for every change against main |
 <!-- END COMMITS -->
 
 ---
