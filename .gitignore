@@ -39,3 +39,6 @@ act/pipeline/Shiyang/configs/*.tmp
 # 未入库的文档草稿与大图（本地保留）
 act/pipeline/Shiyang/docs/PPT_BRIEF_*.md
 act/pipeline/Shiyang/docs/*.png
+
+# Experiment data synced from the lab server; large and reproducible, never committed.
+server_results/
