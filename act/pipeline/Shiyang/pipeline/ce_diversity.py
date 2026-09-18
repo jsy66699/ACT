@@ -269,7 +269,11 @@ def constraints(net, spec, shape, x_flat, inst, chunk=64):
         rows = torch.full((len(xb),), int(inst), dtype=torch.long)
         sev = spec.severity(net(xb), rows=rows)
         g, = torch.autograd.grad(sev.sum(), xb)
-        grads.append(g.detach().reshape(len(xb), -1).to(torch.float64).numpy())
+        # .cpu() before .numpy(): under a torch.device context the model and
+        # everything built from it live on the accelerator, and numpy cannot
+        # read that memory. A CPU-only run never reaches the conversion with a
+        # device tensor, so this only shows up once a GPU is in play.
+        grads.append(g.detach().reshape(len(xb), -1).to(torch.float64).cpu().numpy())
     return np.concatenate(grads)
 
 
