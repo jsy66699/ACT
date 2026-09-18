@@ -781,6 +781,12 @@ class PatternStateManager:
         self._inst_anchor: Dict[int, torch.Tensor] = {}
         self._inst_radius: Dict[int, int] = {}
         self._inst_stall: Dict[int, int] = {}
+        # Seed hash -> the candidate positions that flipped, on the CPU.
+        # The weight row this stands for is `local_bias_low` everywhere and
+        # `local_bias_high` at these positions, so storing the row densely kept
+        # num_candidates floats per admitted seed on the accelerator and never
+        # freed them -- ~32 GB inside one tinyimagenet trial. The positions are
+        # a few dozen indices, and the row is rebuilt on read.
         self._local_bias: Dict[bytes, torch.Tensor] = {}
         self._ce_seeds: List[Dict[str, torch.Tensor]] = []
 
@@ -1003,13 +1009,21 @@ class PatternStateManager:
         small background weight over the rest (exploration).
         `flipped_candidate_positions` are indices into `self.candidate_indices`
         (i.e. already restricted-space indices, not raw neuron ids)."""
+        self._local_bias[self.hash_seed(new_seed)] = (
+            flipped_candidate_positions.detach().to("cpu", torch.long).clone())
+
+    def _dense_bias(self, positions: torch.Tensor) -> torch.Tensor:
+        """Rebuild the stored row: `local_bias_low` everywhere, `local_bias_high`
+        at the positions that flipped. Bit-identical to what update_local_bias
+        used to keep, which is why the switch to sparse storage changes no run."""
         weights = torch.full((self.num_candidates,), self.local_bias_low, device=self.device)
-        if flipped_candidate_positions.numel() > 0:
-            weights[flipped_candidate_positions] = self.local_bias_high
-        self._local_bias[self.hash_seed(new_seed)] = weights
+        if positions.numel() > 0:
+            weights[positions.to(self.device)] = self.local_bias_high
+        return weights
 
     def local_bias(self, seed_tensor: torch.Tensor) -> Optional[torch.Tensor]:
-        return self._local_bias.get(self.hash_seed(seed_tensor))
+        positions = self._local_bias.get(self.hash_seed(seed_tensor))
+        return None if positions is None else self._dense_bias(positions)
 
     def sparsity_weights(self, natural_restricted: torch.Tensor) -> torch.Tensor:
         """[B, C] flip scores: high where flipping LEAVES a crowded side.
@@ -1214,8 +1228,8 @@ class PatternStateManager:
         flat = seed_tensors.detach().to(torch.float32).cpu().numpy().reshape(B, -1)
         rows = []
         for b in range(B):
-            w = self._local_bias.get(flat[b].tobytes())
-            rows.append(w if w is not None
+            positions = self._local_bias.get(flat[b].tobytes())
+            rows.append(self._dense_bias(positions) if positions is not None
                         else torch.full((self.num_candidates,), 1.0, device=self.device))
         return torch.stack(rows, dim=0)
 

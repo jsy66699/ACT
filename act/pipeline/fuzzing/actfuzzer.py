@@ -939,6 +939,11 @@ class ACTFuzzer:
         fold into) interesting_mask."""
         assert self.state_manager is not None
         B = child_inputs.shape[0]
+        # local_bias is read back only by HPGD's target selection
+        # (_fuzz_iteration guards the read on _hpgd_strategy), so recording it
+        # with HPGD off filled a never-consulted table: statebase reached 44 GB
+        # of accelerator memory on tinyimagenet writing rows nothing would read.
+        record_bias = self._hpgd_strategy is not None
 
         # Exact-match admission is the default (diversity_threshold 1), and it
         # is the case a fingerprint can answer in bulk. Anything larger is a
@@ -953,7 +958,7 @@ class ACTFuzzer:
                 original_indices=parent_seeds.original_index,
                 is_ce_mask=violation_mask,
             )
-            if admitted.any():
+            if record_bias and admitted.any():
                 restricted_natural = self.state_manager.restrict(natural_pattern)
                 restricted_achieved = self.state_manager.restrict(achieved_pattern)
                 for b in admitted.nonzero(as_tuple=True)[0].tolist():
@@ -976,7 +981,7 @@ class ACTFuzzer:
                 energy_bonus=(5.0 if is_ce else 1.0),
             )
             admitted[b] = ok
-            if ok:
+            if ok and record_bias:
                 restricted_natural = self.state_manager.restrict(natural_pattern[b])
                 restricted_achieved = self.state_manager.restrict(achieved_pattern[b])
                 flipped = (restricted_natural != restricted_achieved).nonzero(as_tuple=True)[0]
