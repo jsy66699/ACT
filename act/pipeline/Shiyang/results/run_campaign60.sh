@@ -65,6 +65,7 @@ bench_cfg () {
     mnist)     echo "div_mnist mnist_fc_v2 90" ;;
     cifar)     echo "div_cifar cifar100_2024 200" ;;
     safenlp)   echo "div_safenlp safenlp_2024 200" ;;
+    tin)       echo "div_tin tinyimagenet_v2 200" ;;
     eransig)   echo "div_eran_sig6x100 eran_sigmoid_tanh_mlp 99" ;;
     erantanh)  echo "div_eran_tanh6x100 eran_sigmoid_tanh_mlp 394" ;;
     *)         echo "" ;;

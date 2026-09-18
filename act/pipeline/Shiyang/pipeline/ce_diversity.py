@@ -144,6 +144,11 @@ BENCH = {
     "safenlp": dict(dir="div_safenlp", category="safenlp_2024", max_instances=200,
                     group_re=r"(hyperrectangle_[0-9]+)",
                     label="safenlp_2024, 200 specs / 2 groups / 60 s per group"),
+    # One model group holds all 200 specs, so a trial yields one row and n is
+    # the repeat count, not repeats x groups as everywhere else.
+    "tin": dict(dir="div_tin", category="tinyimagenet_v2", max_instances=200,
+                group_re=r"^TinyImageNet_(resnet_(?:medium|large))",
+                label="tinyimagenet_v2, 200 specs / 1 group / 60 s"),
     # The two smooth-activation entries. Unlike the four above, each dump run
     # covered ONE model group (--instance-indices), because the category holds
     # six ONNX nets and a "first N specs" prefix cannot isolate the tanh ones:
@@ -194,7 +199,7 @@ CAMPAIGN_D = {
     "erantanh": {"baseline": (1.4, 0.5, 5), "statebase": (2.2, 0.4, 5),
                  "statehpgd": (1.8, 0.7, 5)},
 }
-ORDER = ["cora", "mnist", "cifar", "safenlp", "eransig", "erantanh"]
+ORDER = ["cora", "mnist", "cifar", "safenlp", "tin", "eransig", "erantanh"]
 
 
 # --------------------------------------------------------------------------
