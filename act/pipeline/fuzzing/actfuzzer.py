@@ -1156,8 +1156,12 @@ class ACTFuzzer:
             hp = self._hpgd_strategy
             if hp is not None and hp.last_target_pattern is not None:
                 rows = seeds.original_index.to(self.device)
-                tgt_seen = self.state_manager.seen_mask(hp.last_target_pattern, rows)
-                ach_seen = self.state_manager.seen_mask(hp.last_achieved_pattern, rows)
+                # .cpu() is load-bearing: seen_mask builds its result with a
+                # bare torch.tensor, so under a torch.device context it lands on
+                # the accelerator, while reached/moved below are explicitly CPU.
+                # The loop indexes both groups, so they must agree.
+                tgt_seen = self.state_manager.seen_mask(hp.last_target_pattern, rows).cpu()
+                ach_seen = self.state_manager.seen_mask(hp.last_achieved_pattern, rows).cpu()
                 nat, tgt, ach = (hp.last_natural_pattern, hp.last_target_pattern,
                                  hp.last_achieved_pattern)
                 reached = (tgt == ach).all(dim=1).cpu()
@@ -1180,7 +1184,7 @@ class ACTFuzzer:
 
                 use = hp.target_override_mask
                 named = (use.cpu() if use is not None and use.shape[0] == asked.shape[0]
-                         else torch.zeros(asked.shape[0], dtype=torch.bool))
+                         else torch.zeros(asked.shape[0], dtype=torch.bool, device="cpu"))
                 d = self._hpgd_diag
                 d["calls"] += 1
                 for key, sel in (("named", named), ("random", ~named)):
