@@ -781,7 +781,10 @@ class PatternStateManager:
         self._inst_anchor: Dict[int, torch.Tensor] = {}
         self._inst_radius: Dict[int, int] = {}
         self._inst_stall: Dict[int, int] = {}
-        # Seed hash -> the candidate positions that flipped, on the CPU.
+        # Seed hash -> the candidate positions that flipped, on this manager's
+        # device: local_bias_batch rebuilds a row per lane, so keeping them on
+        # the host would add one small transfer per lane per iteration (B=200
+        # on tinyimagenet, against a ~4 ms iteration).
         # The weight row this stands for is `local_bias_low` everywhere and
         # `local_bias_high` at these positions, so storing the row densely kept
         # num_candidates floats per admitted seed on the accelerator and never
@@ -1010,7 +1013,7 @@ class PatternStateManager:
         `flipped_candidate_positions` are indices into `self.candidate_indices`
         (i.e. already restricted-space indices, not raw neuron ids)."""
         self._local_bias[self.hash_seed(new_seed)] = (
-            flipped_candidate_positions.detach().to("cpu", torch.long).clone())
+            flipped_candidate_positions.detach().to(self.device, torch.long).clone())
 
     def _dense_bias(self, positions: torch.Tensor) -> torch.Tensor:
         """Rebuild the stored row: `local_bias_low` everywhere, `local_bias_high`
